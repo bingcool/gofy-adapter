@@ -1,0 +1,7 @@
+.idea/
+.workbuddy/
+*.log
+bin/
+dist/
+go.work
+go.work.sum

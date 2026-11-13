@@ -9,7 +9,7 @@ Nacos 服务发现实现，用于把服务名解析成 `client.Resolver` 需要�
 ```go
 import (
     "github.com/yourorg/interface-service/appinterface/demoservice/demoserviceclient"
-    resolvernacos "github.com/bingcool/gofy-interface-gofy/client/nacos"
+    resolvernacos "github.com/bingcool/gofy-adapter/client/nacos"
 )
 
 // nacos.yaml 提供连接信息，application.yaml 提供 discovery_service_client

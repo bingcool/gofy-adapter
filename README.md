@@ -1,4 +1,4 @@
-# gofy-interface-gofy
+# gofy-adapter
 
 把 `gofy-interface-api` 的纯契约原语适配到 gofy 框架的桥接层，包含：
 
@@ -13,7 +13,7 @@
 本模块承担全部 gofy 耦合，两者互不依赖：
 
 ```
-gofy-interface-api  <---- require ----  gofy-interface-gofy  ---- require ---->  gofy
+gofy-interface-api  <---- require ----  gofy-adapter  ---- require ---->  gofy
         ^                                      ^                                  ^
         |                                      |                                  |
    项目契约模块                          业务服务 demo-service  -------------------+
@@ -30,7 +30,7 @@ gofy-interface-api  <---- require ----  gofy-interface-gofy  ---- require ----> 
 wwwroot/
 ├── gofy/
 ├── gofy-interface-api/
-└── gofy-interface-gofy/   # 本仓库
+└── gofy-adapter/   # 本仓库
 ```
 
 ```bash

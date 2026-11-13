@@ -1,4 +1,4 @@
-module github.com/bingcool/gofy-interface-gofy
+module github.com/bingcool/gofy-adapter
 
 go 1.26.0
 

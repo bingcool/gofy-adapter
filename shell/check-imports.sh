@@ -17,6 +17,12 @@ ALLOWED_EXTERNAL = (
     "github.com/getkin/kin-openapi",
     "github.com/swaggest/swgui",
     "gopkg.in/yaml.v3",
+    # adapter/lease/k8slease: the Kubernetes lock lives here precisely so the
+    # core module does not have to carry client-go.
+    # adapter/lease/k8slease 用的客户端放在这里，核心模块因此不必背 client-go。
+    "k8s.io/client-go",
+    "k8s.io/api",
+    "k8s.io/apimachinery",
 )
 
 problems = []

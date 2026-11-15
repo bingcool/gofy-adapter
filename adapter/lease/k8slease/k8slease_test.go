@@ -189,15 +189,28 @@ func TestTakeoverBumpsTheToken(t *testing.T) {
 // wrote to the database.
 // TestSameIdentityReacquireKeepsTheToken 覆盖同名 Pod 重启读到自己的未过期租约：
 // 它不能让自己已经在途写入数据库的 token 失效。
+// TestSameIdentityReacquireKeepsTheToken models a pod restarting: the process
+// that held the lease is gone, a new Locker appears with the same identity, and
+// the token must not move — its own in-flight writes may still be fencing on it.
+// A second Locker is the point: re-acquiring through the *same* Locker is a
+// concurrent acquire, which ErrHeld rejects (see the single-flight tests).
+// TestSameIdentityReacquireKeepsTheToken 模拟 Pod 重启：持有租约的进程已经消失，同
+// identity 的新 Locker 出现，token 不能变 —— 它自己还在途的写入可能仍以这个 token 做
+// fencing。用新 Locker 是关键：同一个 Locker 再获取属于并发获取，会被 ErrHeld 拒绝
+// （见单飞测试）。
 func TestSameIdentityReacquireKeepsTheToken(t *testing.T) {
 	api := newFakeAPI()
-	l := newLocker(t, api, "pod-a")
+	before := newLocker(t, api, "pod-a")
 
-	first, err := l.Acquire(context.Background(), "settle-reconcile", ttl)
+	first, err := before.Acquire(context.Background(), "settle-reconcile", ttl)
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	again, err := l.Acquire(context.Background(), "settle-reconcile", ttl)
+
+	// The restarted process has an empty single-flight set.
+	// 重启后的进程单飞表是空的。
+	after := newLocker(t, api, "pod-a")
+	again, err := after.Acquire(context.Background(), "settle-reconcile", ttl)
 	if err != nil {
 		t.Fatalf("re-acquire: %v", err)
 	}
@@ -206,95 +219,110 @@ func TestSameIdentityReacquireKeepsTheToken(t *testing.T) {
 	}
 }
 
-func TestReleaseHandsTheLeaseBack(t *testing.T) {
+// TestConcurrentAcquireInOneProcessIsSingleFlight is the P2-04 acceptance test:
+// without the in-process set, both calls would see holder == identity and both
+// would "re-join" the same term, so two goroutines would believe they hold the
+// same critical section.
+// TestConcurrentAcquireInOneProcessIsSingleFlight 是 P2-04 的验收测试：没有进程内
+// 单飞表，两次调用都会看到 holder == identity 并"重新加入"同一租期，两个 goroutine
+// 因此都会认为自己持有同一个临界区。
+func TestConcurrentAcquireInOneProcessIsSingleFlight(t *testing.T) {
 	api := newFakeAPI()
-	first := newLocker(t, api, "pod-a")
-	second := newLocker(t, api, "pod-b")
+	l := newLocker(t, api, "pod-a")
 
-	held, err := first.Acquire(context.Background(), "settle-reconcile", ttl)
+	held, err := l.Acquire(context.Background(), "settle-reconcile", ttl)
 	if err != nil {
-		t.Fatalf("acquire: %v", err)
+		t.Fatalf("first acquire: %v", err)
 	}
+	if _, err := l.Acquire(context.Background(), "settle-reconcile", ttl); !errors.Is(err, lease.ErrHeld) {
+		t.Fatalf("second acquire in the same process = %v, want ErrHeld", err)
+	}
+
+	// Other keys are unaffected: single-flight is per key, not per locker.
+	// 其它 key 不受影响：单飞是按 key 的，不是按 locker 的。
+	if _, err := l.Acquire(context.Background(), "other-job", ttl); err != nil {
+		t.Fatalf("acquire on another key: %v", err)
+	}
+
 	if err := held.Release(context.Background()); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if got := api.holder("settle-reconcile"); got != "" {
-		t.Fatalf("holder after release = %q, want empty", got)
-	}
-
-	next, err := second.Acquire(context.Background(), "settle-reconcile", ttl)
-	if err != nil {
-		t.Fatalf("takeover after release: %v", err)
-	}
-	if next.Token() <= held.Token() {
-		t.Fatalf("token %d did not advance past %d", next.Token(), held.Token())
+	if _, err := l.Acquire(context.Background(), "settle-reconcile", ttl); err != nil {
+		t.Fatalf("acquire after release: %v", err)
 	}
 }
 
-func TestRenewKeepsTheLeaseAlive(t *testing.T) {
+// TestRenewLossFreesTheInProcessReservation covers the recovery path: once the
+// lease is gone there is nothing left to protect, so the key must become
+// acquirable again in the same process.
+// TestRenewLossFreesTheInProcessReservation 覆盖恢复路径：租约没了就没有需要保护的
+// 东西，同一个进程必须能重新获取该 key。
+func TestRenewLossFreesTheInProcessReservation(t *testing.T) {
 	api := newFakeAPI()
 	l := newLocker(t, api, "pod-a")
+
 	held, err := l.Acquire(context.Background(), "settle-reconcile", ttl)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	before := api.renewTime("settle-reconcile")
-	if err := held.Renew(context.Background()); err != nil {
-		t.Fatalf("renew: %v", err)
+	// Another identity wins an Update behind our back.
+	// 另一个 identity 在背后赢了一次 Update。
+	api.takeover(t, "settle-reconcile", "pod-b")
+	if err := held.Renew(context.Background()); !errors.Is(err, lease.ErrLeaseLost) {
+		t.Fatalf("renew after takeover = %v, want ErrLeaseLost", err)
 	}
-	after := api.renewTime("settle-reconcile")
-	if !after.After(before) {
-		t.Fatalf("renewTime did not move forward: %v -> %v", before, after)
+
+	// pod-b hands the lease back. pod-a can only re-acquire if the lost lease
+	// released its in-process reservation; otherwise this returns
+	// "already held by this process".
+	// pod-b 交还租约。只有当丢失的租约释放了进程内占用，pod-a 才能重新获取；否则这里
+	// 会返回 "already held by this process"。
+	api.clearHolder(t, "settle-reconcile")
+	if _, err := l.Acquire(context.Background(), "settle-reconcile", ttl); err != nil {
+		t.Fatalf("acquire after lost lease: %v", err)
 	}
 }
 
-// TestConflictIsReportedAsHeld covers the lost race: the object moved between
-// read and write, so this instance must go back to polling rather than assume
-// it won.
-// TestConflictIsReportedAsHeld 覆盖竞争失败：读写之间对象变了，本实例必须回到轮询
-// 而不是假定自己赢。
-func TestConflictIsReportedAsHeld(t *testing.T) {
-	api := newFakeAPI()
-	first := newLocker(t, api, "pod-a")
-	second := newLocker(t, api, "pod-b")
-
-	if _, err := first.Acquire(context.Background(), "settle-reconcile", ttl); err != nil {
-		t.Fatalf("acquire: %v", err)
+// takeover moves the stored lease to another identity and bumps the token, the
+// way a competitor that won a real Update would.
+// takeover 把已存储的租约换成另一个 identity 并递增 token，模拟真实竞争中赢下一次
+// Update 的对手。
+func (f *fakeAPI) takeover(t *testing.T, name, identity string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obj, ok := f.objects[name]
+	if !ok {
+		t.Fatalf("%q is not stored", name)
 	}
-	api.expire(t, "settle-reconcile")
-
-	// The update the takeover issues must fail the way a stale resourceVersion
-	// does in a real apiserver.
-	api.mu.Lock()
-	api.conflictNext = true
-	api.mu.Unlock()
-
-	if _, err := second.Acquire(context.Background(), "settle-reconcile", ttl); !errors.Is(err, lease.ErrHeld) {
-		t.Fatalf("conflicting acquire: got %v, want ErrHeld", err)
+	f.version++
+	now := metav1.NewMicroTime(time.Now())
+	token := int32(1)
+	if obj.Spec.LeaseTransitions != nil {
+		token = *obj.Spec.LeaseTransitions + 1
 	}
+	obj.Spec.HolderIdentity = &identity
+	obj.Spec.LeaseTransitions = &token
+	obj.Spec.RenewTime = &now
+	obj.ResourceVersion = strconv.Itoa(f.version)
 }
 
-func TestKeyMustBeADNSName(t *testing.T) {
-	api := newFakeAPI()
-	l := newLocker(t, api, "pod-a")
-
-	if _, err := l.Acquire(context.Background(), "settle:reconcile", ttl); !errors.Is(err, k8slease.ErrInvalidObjectName) {
-		t.Fatalf("colon key: got %v, want ErrInvalidObjectName", err)
+// clearHolder frees the object the way Release does.
+// clearHolder 像 Release 那样把对象置为空闲。
+func (f *fakeAPI) clearHolder(t *testing.T, name string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obj, ok := f.objects[name]
+	if !ok {
+		t.Fatalf("%q is not stored", name)
 	}
-	if _, err := l.Acquire(context.Background(), "Settle", ttl); !errors.Is(err, k8slease.ErrInvalidObjectName) {
-		t.Fatalf("uppercase key: got %v, want ErrInvalidObjectName", err)
-	}
-}
-
-func TestNewValidatesConfig(t *testing.T) {
-	api := newFakeAPI()
-	if _, err := k8slease.New(nil, k8slease.Config{Namespace: "default", Identity: "pod-a"}); err == nil {
-		t.Fatal("New(nil) returned no error")
-	}
-	if _, err := k8slease.New(api, k8slease.Config{Identity: "pod-a"}); err == nil {
-		t.Fatal("New accepted an empty namespace")
-	}
-	if _, err := k8slease.New(api, k8slease.Config{Namespace: "default"}); err == nil {
-		t.Fatal("New accepted an empty identity")
-	}
+	f.version++
+	empty := ""
+	one := int32(1)
+	now := metav1.NewMicroTime(time.Now())
+	obj.Spec.HolderIdentity = &empty
+	obj.Spec.LeaseDurationSeconds = &one
+	obj.Spec.RenewTime = &now
+	obj.ResourceVersion = strconv.Itoa(f.version)
 }

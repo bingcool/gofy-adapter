@@ -283,6 +283,37 @@ func TestRenewLossFreesTheInProcessReservation(t *testing.T) {
 	}
 }
 
+// TestRenewConflictFreesTheInProcessReservation covers the resource-version
+// conflict branch: the holder/token never changed, only the Update lost a race,
+// but Renew reports LeaseLost and must still release the local reservation.
+// Otherwise the same Locker is stuck in ErrHeld forever.
+// TestRenewConflictFreesTheInProcessReservation 覆盖 resourceVersion 冲突分支：holder/token
+// 没变，只是 Update 竞争失败，但 Renew 已经报告 LeaseLost，就必须释放本地占用；否则同一个
+// Locker 会永久卡在 ErrHeld。
+func TestRenewConflictFreesTheInProcessReservation(t *testing.T) {
+	api := newFakeAPI()
+	l := newLocker(t, api, "pod-a")
+
+	held, err := l.Acquire(context.Background(), "settle-reconcile", ttl)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// Force the next Update to conflict without changing holder or token.
+	// 强制下一次 Update 冲突，但不改 holder/token。
+	api.conflictNext = true
+	if err := held.Renew(context.Background()); !errors.Is(err, lease.ErrLeaseLost) {
+		t.Fatalf("renew on conflict = %v, want ErrLeaseLost", err)
+	}
+
+	// The conflict was one-shot. The same Locker must be able to re-acquire,
+	// which only works if the failed Renew released its reservation.
+	// 这次冲突是一次性的。同一个 Locker 必须能重新获取，而这只有在失败的 Renew 释放了
+	// 进程内占用之后才可能。
+	if _, err := l.Acquire(context.Background(), "settle-reconcile", ttl); err != nil {
+		t.Fatalf("acquire after renew conflict: %v", err)
+	}
+}
+
 // takeover moves the stored lease to another identity and bumps the token, the
 // way a competitor that won a real Update would.
 // takeover 把已存储的租约换成另一个 identity 并递增 token，模拟真实竞争中赢下一次

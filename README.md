@@ -37,7 +37,10 @@ Kubernetes 自身选举用的那套对象。它放在本模块而不是 `gofy`�
 ```go
 locker, err := k8slease.NewForConfig(restCfg, k8slease.Config{
     Namespace: "prod",
-    Identity:  podName, // 必须每个进程唯一
+    // 必须每个进程唯一：一个 Pod 只跑一个应用进程时用 Pod 名即可，
+    // 否则用 Pod UID + 进程/实例标识（如 podName + "/" + pid），
+    // 两个进程共用一个 Identity 会互相"恢复续租"。
+    Identity:  podName + "/" + strconv.Itoa(os.Getpid()),
 })
 held, err := locker.Acquire(ctx, "settle-reconcile", 30*time.Second)
 if errors.Is(err, lease.ErrHeld) {
@@ -65,8 +68,9 @@ rules:
 
 **三条硬约束**：
 
-1. **Identity 必须每个进程唯一**（Pod 名即可）。两个进程用同一 Identity 会互相"恢复
-   续租"，都以为自己持有锁。
+1. **Identity 必须每个进程唯一**。只有"一个 Pod 跑一个应用进程"时才能直接用 Pod 名；
+   一个 Pod 内多进程（sidecar、多实例）必须再加进程/实例标识，例如 `podName + "/" + pid`，
+   跨重启稳定时可用 Pod UID。两个进程用同一 Identity 会互相"恢复续租"，都以为自己持有锁。
 2. **不要删除 Lease 对象**。fencing token 取 `spec.leaseTransitions`，删对象会让它
    归零，而被保护的资源可能仍在用旧 token；只需要 `get/create/update` 权限，RBAC 里
    不给 `delete` 就是最直接的保险。

@@ -336,6 +336,13 @@ func (h *heldLease) Renew(ctx context.Context) error {
 	next.Spec.LeaseDurationSeconds = &seconds
 	updated, err := h.locker.api.Update(ctx, next, metav1.UpdateOptions{})
 	if apierrors.IsConflict(err) {
+		// A conflict means this renew lost the race. We can no longer prove we
+		// hold the lease, so drop the in-process reservation just like the
+		// NotFound and changed-holder branches above — otherwise Acquire on this
+		// Locker stays stuck in ErrHeld forever after the caller gives up.
+		// 冲突意味着这次续期竞争失败，已经无法证明仍持有租约，因此和上面 NotFound、
+		// holder 变更两个分支一样释放进程内占用；否则调用方放弃后本 Locker 会永久 ErrHeld。
+		h.locker.unreserve(h.key)
 		return fmt.Errorf("%w: %s (resource version moved)", lease.ErrLeaseLost, h)
 	}
 	if err != nil {

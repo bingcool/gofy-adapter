@@ -31,9 +31,40 @@ type fakeNaming struct {
 	fail    bool
 	calls   int
 	queries []url.Values
+
+	// listGate, when set, blocks the first list request until released. It lets
+	// a test hold one refresh in flight while other Resolve calls pile up.
+	// listGate 设置后会阻塞第一次 list 请求直到被释放，用于让一个刷新保持在途、
+	// 其他 Resolve 调用同时涌进来。
+	listGate *testGate
+}
+
+type testGate struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newTestGate() *testGate {
+	return &testGate{started: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+// wait blocks only the first caller until release is closed.
+// wait 只阻塞第一个调用方，直到 release 被关闭。
+func (g *testGate) wait() {
+	g.once.Do(func() {
+		g.started <- struct{}{}
+		<-g.release
+	})
 }
 
 func (f *fakeNaming) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Block the first list request before taking the mutex, so other Resolve
+	// calls can pile up in the singleflight while this one is in flight.
+	if r.URL.Path == testListPath && f.listGate != nil {
+		f.listGate.wait()
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -133,6 +164,60 @@ func newTestResolver(t *testing.T, cfg Config) (*Resolver, *fakeNaming) {
 		t.Fatalf("New: %v", err)
 	}
 	return resolver, fake
+}
+
+// TestResolveCoalescesConcurrentRefresh verifies the per-service singleflight:
+// N concurrent Resolve calls on an empty cache produce one Nacos query and all
+// callers get a usable address. Without coalescing each caller would hit Nacos.
+// TestResolveCoalescesConcurrentRefresh 验证 per-service 单飞：空缓存下 N 个并发 Resolve 只产生
+// 一次 Nacos 查询，且每个调用方都拿到可用地址。没有合并时每个调用方都会打向 Nacos。
+func TestResolveCoalescesConcurrentRefresh(t *testing.T) {
+	gate := newTestGate()
+	fake := &fakeNaming{
+		hosts:    []nacosconfig.Instance{healthyInstance("10.0.0.7", 8080, 1)},
+		listGate: gate,
+	}
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+	resolver, err := New(Config{Addr: server.URL, Namespace: "dev", CacheTTL: time.Minute})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const n = 32
+	results := make([]string, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = resolver.Resolve(context.Background(), "orders")
+		}(i)
+	}
+
+	close(start)
+	// Wait until the leader's list request is actually in flight, then let the
+	// other callers reach the singleflight before releasing it.
+	// 等到 leader 的 list 请求确实在途，再让其他调用方进入单飞，然后放行。
+	<-gate.started
+	time.Sleep(50 * time.Millisecond)
+	close(gate.release)
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("Resolve[%d]: %v", i, errs[i])
+		}
+		if results[i] != "http://10.0.0.7:8080" {
+			t.Fatalf("Resolve[%d] = %q", i, results[i])
+		}
+	}
+	if calls, _ := fake.snapshot(); calls != 1 {
+		t.Fatalf("list calls = %d, want 1 for %d concurrent Resolve", calls, n)
+	}
 }
 
 func healthyInstance(ip string, port int, weight float64) nacosconfig.Instance {

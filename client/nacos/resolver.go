@@ -121,6 +121,23 @@ type Resolver struct {
 	mu    sync.Mutex
 	cache map[string]*entry
 	rr    map[string]uint64
+	// inflight holds one refresh per service so a cache expiry under a burst of
+	// Resolve calls triggers a single Nacos query. Callers that find a refresh
+	// already running wait for it and share the result instead of all hitting
+	// Nacos (and, when Nacos is down, all amplifying the outage).
+	// inflight 为每个 service 保留一次刷新，缓存过期时的并发 Resolve 只会触发一次 Nacos 查询。
+	// 发现已有刷新在途的调用方等待并共享结果，而不是一起打向 Nacos（Nacos 故障时也就不会
+	// 一起放大故障）。
+	inflight map[string]*refresh
+}
+
+// refresh is one in-flight Nacos lookup for a service. Closing done publishes
+// instances/err to every waiter.
+// refresh 是某个 service 的一次在途查询；关闭 done 即向所有等待者发布 instances/err。
+type refresh struct {
+	done      chan struct{}
+	instances []nacosconfig.Instance
+	err       error
 }
 
 type entry struct {
@@ -167,15 +184,17 @@ func New(cfg Config) (*Resolver, error) {
 		cfg.StaleTTL = max(3*cfg.CacheTTL, 180*time.Second)
 	}
 	return &Resolver{
-		client: client,
-		cfg:    cfg,
-		cache:  make(map[string]*entry),
-		rr:     make(map[string]uint64),
+		client:   client,
+		cfg:      cfg,
+		cache:    make(map[string]*entry),
+		rr:       make(map[string]uint64),
+		inflight: make(map[string]*refresh),
 	}, nil
 }
 
 // Resolve implements client.Resolver.
-// Resolve 实现 client.Resolver：缓存未过期时直接选址，否则回源 Nacos。
+// Resolve 实现 client.Resolver：缓存未过期时直接选址，否则回源 Nacos；同一 service 的并发
+// 回源会被合并成一次查询。
 func (r *Resolver) Resolve(ctx context.Context, service string) (string, error) {
 	service = strings.TrimSpace(service)
 	if service == "" {
@@ -190,29 +209,80 @@ func (r *Resolver) Resolve(ctx context.Context, service string) (string, error) 
 		r.mu.Unlock()
 		return baseURL(inst), nil
 	}
+
+	// A refresh for this service is already running: wait for it (respecting
+	// the caller's context) and share its result rather than querying Nacos
+	// again. Choose still happens under the lock in each waiter so round-robin
+	// counters advance once per resolved call.
+	// 该 service 已有刷新在途：等待它（尊重调用方 context）并共享结果，而不是再查一次 Nacos。
+	// 选址仍在锁内按调用方各做一次，保证 round-robin 计数按调用次数推进。
+	if rf := r.inflight[service]; rf != nil {
+		r.mu.Unlock()
+		select {
+		case <-rf.done:
+		case <-ctx.Done():
+			return "", fmt.Errorf("nacos resolver: %q: waiting for refresh: %w", service, ctx.Err())
+		}
+		return r.resolveRefreshed(service, cached, rf.instances, rf.err)
+	}
+
+	// Become the leader for this service.
+	// 成为该 service 的刷新 leader。
+	rf := &refresh{done: make(chan struct{})}
+	r.inflight[service] = rf
 	r.mu.Unlock()
 
 	instances, err := r.list(ctx, service)
-	if err != nil {
-		r.mu.Lock()
-		if cached != nil && len(cached.instances) > 0 && now.Sub(cached.lastSuccess) <= r.cfg.StaleTTL {
+	if err == nil {
+		instances = r.filter(instances)
+		if len(instances) == 0 {
+			err = fmt.Errorf("%w: %q", ErrNoInstances, service)
+		}
+	}
+
+	r.mu.Lock()
+	if err == nil {
+		// Timestamp the cache when the refresh completes, not when it started:
+		// a slow ListInstances would otherwise make the entry look older than it
+		// is and expire early.
+		// 用刷新完成时刻给缓存打时间戳，而不是开始时刻：慢的 ListInstances 否则会让条目显得比
+		// 实际更旧、提前过期。
+		fetched := time.Now()
+		r.cache[service] = &entry{instances: instances, fetchedAt: fetched, lastSuccess: fetched}
+	} else if errors.Is(err, ErrNoInstances) {
+		delete(r.cache, service)
+	}
+	rf.instances = instances
+	rf.err = err
+	delete(r.inflight, service)
+	close(rf.done)
+	r.mu.Unlock()
+
+	return r.resolveRefreshed(service, cached, instances, err)
+}
+
+// resolveRefreshed turns a shared refresh result into an address. Both the
+// leader and the waiters use it, so stale fallback and error wording stay
+// identical no matter who performed the Nacos query.
+// resolveRefreshed 把共享的刷新结果转换成地址。leader 与等待者都走这里，因此无论谁真正查询了
+// Nacos，stale 回退与错误措辞都保持一致。
+func (r *Resolver) resolveRefreshed(service string, cached *entry, instances []nacosconfig.Instance, refreshErr error) (string, error) {
+	if refreshErr != nil {
+		// A failed refresh can still serve the last good list within StaleTTL.
+		// Measure from now, not from when this caller entered Resolve: a waiter
+		// that queued behind a slow leader must not stretch the stale window.
+		// 刷新失败时仍可在 StaleTTL 内使用最近一次成功的列表。从当前时刻算，而不是调用方进入
+		// Resolve 的时刻：排在慢 leader 后面的等待者不该把 stale 窗口拉长。
+		if cached != nil && len(cached.instances) > 0 && time.Since(cached.lastSuccess) <= r.cfg.StaleTTL {
+			r.mu.Lock()
 			inst := r.chooseLocked(service, cached.instances)
 			r.mu.Unlock()
 			return baseURL(inst), nil
 		}
-		r.mu.Unlock()
-		return "", fmt.Errorf("nacos resolver: %q: %w", service, err)
-	}
-	instances = r.filter(instances)
-	if len(instances) == 0 {
-		r.mu.Lock()
-		delete(r.cache, service)
-		r.mu.Unlock()
-		return "", fmt.Errorf("%w: %q", ErrNoInstances, service)
+		return "", fmt.Errorf("nacos resolver: %q: %w", service, refreshErr)
 	}
 
 	r.mu.Lock()
-	r.cache[service] = &entry{instances: instances, fetchedAt: now, lastSuccess: now}
 	inst := r.chooseLocked(service, instances)
 	r.mu.Unlock()
 	return baseURL(inst), nil

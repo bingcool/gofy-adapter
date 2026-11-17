@@ -1,5 +1,7 @@
 # gofy-adapter
 
+模块版本：`adapter.Version`（当前 `1.0.0`），供应用在启动日志里与 `gofy.Version` 一起记录。
+
 把 `gofy-interface-api` 的纯契约原语适配到 gofy 框架的桥接层，包含：
 
 - `adapter/gofy/`：把 `endpoint.Descriptor` 绑定到 `support.Router`，提供

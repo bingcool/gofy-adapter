@@ -9,11 +9,14 @@
 //	orders := demoserviceclient.New(c)
 //
 // The resolver caches instance lists for CacheTTL and serves the last good
-// list for up to StaleTTL while Nacos is unreachable.
+// list for up to StaleTTL while Nacos is unreachable. A failed lookup is
+// throttled for the same CacheTTL, so an outage costs one timeout per window
+// instead of one per request.
 // 包 nacos 通过 Nacos 命名服务解析服务名，并接入 client.Resolver。
 //
 // resolver 按 CacheTTL 缓存实例列表；Nacos 不可达时，最多在 StaleTTL 内继续
-// 返回最近一次成功的结果。
+// 返回最近一次成功的结果。失败的回源同样按 CacheTTL 节流，因此一次故障只在一个窗口内
+// 付一次超时，而不是每个请求都付。
 package nacos
 
 import (
@@ -39,6 +42,18 @@ var (
 	// ErrUnknownLoadBalancer is returned by New for an unsupported strategy.
 	// ErrUnknownLoadBalancer 由 New 针对不支持的负载均衡策略返回。
 	ErrUnknownLoadBalancer = errors.New("nacos resolver: unknown load balancer")
+	// ErrStaleTTLShorterThanCache is returned by New when the stale window is
+	// shorter than the cache window: every cache hit after that point would
+	// fail closed even though the list was fetched moments ago.
+	// ErrStaleTTLShorterThanCache 由 New 在 stale 窗口短于缓存窗口时返回：那种配置下
+	// 每次缓存命中都会 fail-closed，哪怕列表刚拉回来。
+	ErrStaleTTLShorterThanCache = errors.New("nacos resolver: stale_ttl is shorter than cache_ttl")
+	// ErrStaleExpired means there is no usable address left: Nacos is
+	// unreachable (or keeps failing) and the last successful list is older than
+	// StaleTTL. The wrapped error, when present, is the newest failure.
+	// ErrStaleExpired 表示没有可用地址了：Nacos 不可达（或持续失败），且最近一次成功
+	// 的列表已经超过 StaleTTL。若存在被包装的错误，那是最近一次失败原因。
+	ErrStaleExpired = errors.New("nacos resolver: cached instances expired")
 )
 
 // Config configures a Resolver. Connection fields mirror nacos.Config;
@@ -61,13 +76,20 @@ type Config struct {
 	// LoadBalancer 取 random、round_robin 或 weight，默认 random。
 	LoadBalancer string
 
-	// CacheTTL keeps an instance list fresh for this long. Default 60s.
-	// CacheTTL 是实例列表的保鲜时长，默认 60s。
+	// CacheTTL keeps an instance list fresh for this long and also throttles
+	// retries after a failure. Default 60s.
+	// CacheTTL 是实例列表的保鲜时长，同时也是一次失败后的重试节流窗口，默认 60s。
 	CacheTTL time.Duration
 	// StaleTTL allows serving a stale list while Nacos is down. Default
-	// max(3*CacheTTL, 180s).
-	// StaleTTL 允许在 Nacos 不可用时继续返回过期列表，默认 max(3*CacheTTL, 180s)。
+	// max(3*CacheTTL, 180s); it must not be shorter than CacheTTL.
+	// StaleTTL 允许在 Nacos 不可用时继续返回过期列表，默认 max(3*CacheTTL, 180s)；
+	// 不得短于 CacheTTL。
 	StaleTTL time.Duration
+	// Timeout bounds one instance-list request. Default 2s: resolution sits on
+	// the request path, so it must not inherit the config-center timeout.
+	// Timeout 限制单次实例列表请求，默认 2s：寻址位于请求路径上，不能沿用配置中心
+	// 的超时。
+	Timeout time.Duration
 
 	// IncludeUnhealthy asks for and returns unhealthy instances too. The
 	// default keeps only healthy instances.
@@ -85,16 +107,22 @@ type Config struct {
 // 成 Resolver 配置。
 func ConfigFromNacos(cfg nacosconfig.Config) Config {
 	return Config{
-		Addr:             cfg.Addr,
-		Host:             cfg.Host,
-		Port:             cfg.Port,
-		Username:         cfg.Username,
-		Password:         cfg.Password,
-		Namespace:        cfg.Discovery.Namespace,
-		Group:            cfg.Discovery.Group,
+		Addr:     cfg.Addr,
+		Host:     cfg.Host,
+		Port:     cfg.Port,
+		Username: cfg.Username,
+		Password: cfg.Password,
+		// The discovery block is normalized by Load, but ConfigFromNacos is
+		// exported and may receive a hand-built Config: fall back to the
+		// connection namespace/group instead of silently querying public.
+		// discovery 段由 Load 归一化，但 ConfigFromNacos 是导出函数，可能收到手工
+		// 构造的 Config：这里回退到连接的 namespace/group，而不是悄悄去查 public。
+		Namespace:        firstNonEmpty(cfg.Discovery.Namespace, cfg.Namespace),
+		Group:            firstNonEmpty(cfg.Discovery.Group, cfg.Group),
 		LoadBalancer:     cfg.Discovery.LoadBalancer,
 		CacheTTL:         cfg.Discovery.CacheTTL,
 		StaleTTL:         cfg.Discovery.StaleTTL,
+		Timeout:          cfg.Discovery.Timeout,
 		IncludeUnhealthy: !cfg.Discovery.HealthyOnly,
 		Clusters:         append([]string(nil), cfg.Discovery.Clusters...),
 	}
@@ -109,6 +137,14 @@ func NewFromFiles(nacosPath, appPath string) (*Resolver, error) {
 	if err != nil {
 		return nil, err
 	}
+	return NewFromConfig(cfg)
+}
+
+// NewFromConfig builds a resolver from an already loaded nacos.Config. It is the
+// one call an assembly root needs; ConfigFromNacos alone still requires New.
+// NewFromConfig 用一份已加载的 nacos.Config 构造 resolver。装配根要的就是这一句；
+// 只用 ConfigFromNacos 还得再调一次 New。
+func NewFromConfig(cfg nacosconfig.Config) (*Resolver, error) {
 	return New(ConfigFromNacos(cfg))
 }
 
@@ -132,23 +168,34 @@ type Resolver struct {
 }
 
 // refresh is one in-flight Nacos lookup for a service. Closing done publishes
-// instances/err to every waiter.
-// refresh 是某个 service 的一次在途查询；关闭 done 即向所有等待者发布 instances/err。
+// the outcome: waiters then read the cache entry the leader wrote. err is only
+// set when the leader gave up because its own caller went away — the one case
+// where no cache entry is written at all.
+// refresh 是某个 service 的一次在途查询；关闭 done 即发布结果：等待者随后读取 leader
+// 写入的缓存条目。只有 leader 因自身调用方取消而放弃、根本没写缓存时，err 才有值。
 type refresh struct {
-	done      chan struct{}
-	instances []nacosconfig.Instance
-	err       error
+	done chan struct{}
+	err  error
 }
 
+// entry is one service's cache slot. Two timestamps, because they answer two
+// different questions: lastAttempt throttles lookups (a failure is an answer
+// too), lastSuccess bounds how long a stale list may still be served.
+// entry 是一个 service 的缓存槽。两个时间戳回答两个不同问题：lastAttempt 用来节流
+// （失败也是一次回答），lastSuccess 用来限定旧列表还能用多久。
 type entry struct {
 	instances   []nacosconfig.Instance
-	fetchedAt   time.Time
+	lastAttempt time.Time
 	lastSuccess time.Time
+	lastErr     error
 }
 
 // New validates cfg and builds a resolver.
 // New 校验配置并构建 resolver；未知的负载均衡策略会直接返回错误。
 func New(cfg Config) (*Resolver, error) {
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 2 * time.Second
+	}
 	conn := nacosconfig.Config{
 		Addr:      cfg.Addr,
 		Host:      cfg.Host,
@@ -156,6 +203,7 @@ func New(cfg Config) (*Resolver, error) {
 		Username:  cfg.Username,
 		Password:  cfg.Password,
 		Namespace: cfg.Namespace,
+		Timeout:   cfg.Timeout,
 	}
 	client, err := nacosconfig.NewNamingClient(conn)
 	if err != nil {
@@ -180,8 +228,12 @@ func New(cfg Config) (*Resolver, error) {
 	if cfg.StaleTTL <= 0 {
 		cfg.StaleTTL = max(3*cfg.CacheTTL, 180*time.Second)
 	}
+	// A shorter stale window would fail every cache hit closed. Refuse it
+	// instead of quietly widening it: whoever wrote the number should see it.
+	// 更短的 stale 窗口会让每次缓存命中都 fail-closed。直接拒绝而不是悄悄放大：
+	// 写这个数字的人应该看到错误。
 	if cfg.StaleTTL < cfg.CacheTTL {
-		cfg.StaleTTL = max(3*cfg.CacheTTL, 180*time.Second)
+		return nil, fmt.Errorf("%w: %s < %s", ErrStaleTTLShorterThanCache, cfg.StaleTTL, cfg.CacheTTL)
 	}
 	return &Resolver{
 		client:   client,
@@ -192,9 +244,20 @@ func New(cfg Config) (*Resolver, error) {
 	}, nil
 }
 
+// Close releases the idle connections held by the naming client. A resolver is
+// usually process-scoped, so this matters at shutdown and in tests.
+// Close 释放命名客户端持有的空闲连接。resolver 通常是进程级的，因此只在停机与测试
+// 里需要。
+func (r *Resolver) Close() error {
+	if r == nil || r.client == nil {
+		return nil
+	}
+	return r.client.Close()
+}
+
 // Resolve implements client.Resolver.
 // Resolve 实现 client.Resolver：缓存未过期时直接选址，否则回源 Nacos；同一 service 的并发
-// 回源会被合并成一次查询。
+// 回源会被合并成一次查询。失败的回源同样写进缓存，因此一次故障只在每个窗口里付一次超时。
 func (r *Resolver) Resolve(ctx context.Context, service string) (string, error) {
 	service = strings.TrimSpace(service)
 	if service == "" {
@@ -203,19 +266,17 @@ func (r *Resolver) Resolve(ctx context.Context, service string) (string, error) 
 
 	now := time.Now()
 	r.mu.Lock()
-	cached := r.cache[service]
-	if cached != nil && len(cached.instances) > 0 && now.Sub(cached.fetchedAt) < r.cfg.CacheTTL {
-		inst := r.chooseLocked(service, cached.instances)
+	if e := r.cache[service]; e != nil && now.Sub(e.lastAttempt) < r.cfg.CacheTTL {
+		base, err := r.serveLocked(service, e, now)
 		r.mu.Unlock()
-		return baseURL(inst), nil
+		return base, err
 	}
 
 	// A refresh for this service is already running: wait for it (respecting
-	// the caller's context) and share its result rather than querying Nacos
-	// again. Choose still happens under the lock in each waiter so round-robin
-	// counters advance once per resolved call.
-	// 该 service 已有刷新在途：等待它（尊重调用方 context）并共享结果，而不是再查一次 Nacos。
-	// 选址仍在锁内按调用方各做一次，保证 round-robin 计数按调用次数推进。
+	// the caller's context) and read what it published rather than querying
+	// Nacos again.
+	// 该 service 已有刷新在途：等待它（尊重调用方 context），读取它发布的结果，而不是
+	// 再查一次 Nacos。
 	if rf := r.inflight[service]; rf != nil {
 		r.mu.Unlock()
 		select {
@@ -223,7 +284,17 @@ func (r *Resolver) Resolve(ctx context.Context, service string) (string, error) 
 		case <-ctx.Done():
 			return "", fmt.Errorf("nacos resolver: %q: waiting for refresh: %w", service, ctx.Err())
 		}
-		return r.resolveRefreshed(service, cached, rf.instances, rf.err)
+		r.mu.Lock()
+		e, refreshErr := r.cache[service], rf.err
+		base, err := r.serveLocked(service, e, time.Now())
+		r.mu.Unlock()
+		if e == nil && refreshErr != nil {
+			// The leader never wrote: report why it gave up instead of
+			// pretending the service has no instances.
+			// leader 什么都没写：报出它放弃的原因，而不是假装服务没有实例。
+			return "", fmt.Errorf("nacos resolver: %q: %w", service, refreshErr)
+		}
+		return base, err
 	}
 
 	// Become the leader for this service.
@@ -232,60 +303,81 @@ func (r *Resolver) Resolve(ctx context.Context, service string) (string, error) 
 	r.inflight[service] = rf
 	r.mu.Unlock()
 
-	instances, err := r.list(ctx, service)
-	if err == nil {
+	instances, listErr := r.list(ctx, service)
+	if listErr == nil {
 		instances = r.filter(instances)
-		if len(instances) == 0 {
-			err = fmt.Errorf("%w: %q", ErrNoInstances, service)
-		}
 	}
+	completed := time.Now()
 
 	r.mu.Lock()
-	if err == nil {
-		// Timestamp the cache when the refresh completes, not when it started:
-		// a slow ListInstances would otherwise make the entry look older than it
-		// is and expire early.
-		// 用刷新完成时刻给缓存打时间戳，而不是开始时刻：慢的 ListInstances 否则会让条目显得比
-		// 实际更旧、提前过期。
-		fetched := time.Now()
-		r.cache[service] = &entry{instances: instances, fetchedAt: fetched, lastSuccess: fetched}
-	} else if errors.Is(err, ErrNoInstances) {
-		delete(r.cache, service)
+	if listErr != nil && ctx.Err() != nil {
+		// The caller went away, so this attempt says nothing about Nacos:
+		// neither throttle the next caller nor overwrite the last good entry.
+		// 调用方已经离开，这次尝试说明不了 Nacos 的状态：既不节流下一个调用方，也不
+		// 覆盖上一条可用记录。
+		rf.err = listErr
+		delete(r.inflight, service)
+		close(rf.done)
+		r.mu.Unlock()
+		return "", fmt.Errorf("nacos resolver: %q: %w", service, listErr)
 	}
-	rf.instances = instances
-	rf.err = err
+
+	// Timestamp the attempt when it completes, not when it started: a slow
+	// ListInstances would otherwise look older than it is and expire early.
+	// 用回源完成时刻打时间戳，而不是开始时刻：慢的 ListInstances 否则会显得比实际
+	// 更旧、提前过期。
+	e := &entry{instances: instances, lastAttempt: completed}
+	if listErr == nil {
+		// A successful empty list is authoritative: it replaces the previous
+		// addresses at once, and the throttle keeps a deploy window from
+		// turning every request into a Nacos query.
+		// 成功的空列表是权威结果：它立刻覆盖旧地址，同时由节流窗口避免发布期间把每个
+		// 请求都变成一次 Nacos 查询。
+		e.lastSuccess = completed
+	} else {
+		e.lastErr = listErr
+		if prev := r.cache[service]; prev != nil {
+			e.instances = prev.instances
+			e.lastSuccess = prev.lastSuccess
+		}
+	}
+	r.cache[service] = e
 	delete(r.inflight, service)
 	close(rf.done)
+	base, err := r.serveLocked(service, e, completed)
 	r.mu.Unlock()
-
-	return r.resolveRefreshed(service, cached, instances, err)
+	return base, err
 }
 
-// resolveRefreshed turns a shared refresh result into an address. Both the
-// leader and the waiters use it, so stale fallback and error wording stay
-// identical no matter who performed the Nacos query.
-// resolveRefreshed 把共享的刷新结果转换成地址。leader 与等待者都走这里，因此无论谁真正查询了
-// Nacos，stale 回退与错误措辞都保持一致。
-func (r *Resolver) resolveRefreshed(service string, cached *entry, instances []nacosconfig.Instance, refreshErr error) (string, error) {
-	if refreshErr != nil {
-		// A failed refresh can still serve the last good list within StaleTTL.
-		// Measure from now, not from when this caller entered Resolve: a waiter
-		// that queued behind a slow leader must not stretch the stale window.
-		// 刷新失败时仍可在 StaleTTL 内使用最近一次成功的列表。从当前时刻算，而不是调用方进入
-		// Resolve 的时刻：排在慢 leader 后面的等待者不该把 stale 窗口拉长。
-		if cached != nil && len(cached.instances) > 0 && time.Since(cached.lastSuccess) <= r.cfg.StaleTTL {
-			r.mu.Lock()
-			inst := r.chooseLocked(service, cached.instances)
-			r.mu.Unlock()
-			return baseURL(inst), nil
-		}
-		return "", fmt.Errorf("nacos resolver: %q: %w", service, refreshErr)
+// serveLocked turns a cache entry into an address. It is the only place that
+// decides between "fresh", "stale but usable" and "no usable address", so the
+// leader, the waiters and the throttled fast path behave identically. The
+// caller must hold r.mu; choosing under the lock is what advances the
+// round-robin cursor once per resolved call.
+// serveLocked 把缓存条目转换成地址。它是唯一判断「新鲜 / 过期但可用 / 没有可用地址」的
+// 地方，因此 leader、等待者与被节流的快速路径行为一致。调用方必须持有 r.mu；在锁内选址
+// 才能让 round-robin 游标按解析次数推进。
+func (r *Resolver) serveLocked(service string, e *entry, now time.Time) (string, error) {
+	if e == nil {
+		return "", fmt.Errorf("%w: %q", ErrNoInstances, service)
 	}
-
-	r.mu.Lock()
-	inst := r.chooseLocked(service, instances)
-	r.mu.Unlock()
-	return baseURL(inst), nil
+	if len(e.instances) > 0 && now.Sub(e.lastSuccess) <= r.cfg.StaleTTL {
+		return baseURL(r.chooseLocked(service, e.instances)), nil
+	}
+	if len(e.instances) == 0 && e.lastErr == nil {
+		return "", fmt.Errorf("%w: %q", ErrNoInstances, service)
+	}
+	if e.lastErr != nil {
+		// Never had a good list: report the failure itself. "Expired cache"
+		// would be misleading when there is no cache to expire.
+		// 从未成功过：直接报失败本身。没有缓存可过期时，说"缓存过期"是误导。
+		if e.lastSuccess.IsZero() {
+			return "", fmt.Errorf("nacos resolver: %q: %w", service, e.lastErr)
+		}
+		return "", fmt.Errorf("%w: %q: %w", ErrStaleExpired, service, e.lastErr)
+	}
+	return "", fmt.Errorf("%w: %q (last successful refresh %s ago)",
+		ErrStaleExpired, service, now.Sub(e.lastSuccess).Round(time.Second))
 }
 
 func (r *Resolver) list(ctx context.Context, service string) ([]nacosconfig.Instance, error) {
@@ -368,6 +460,15 @@ func normalizeBalancer(value string) string {
 	default:
 		return strings.ToLower(strings.TrimSpace(value))
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 var _ gclient.Resolver = (*Resolver)(nil)

@@ -325,6 +325,138 @@ func TestResolveServesStaleWhileNacosIsDown(t *testing.T) {
 	}
 }
 
+// A failed refresh is an answer too: it must throttle the next lookups, or an
+// unreachable Nacos would add one timeout to every single request that misses
+// the cache. 100 Resolve calls after the failure may only produce one lookup.
+// 失败的回源也是一次回答：它必须节流后续查询，否则 Nacos 不可达会给每个未命中缓存的
+// 请求都加一次超时。失败之后的 100 次 Resolve 只允许产生一次回源。
+func TestResolveThrottlesFailedRefresh(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		CacheTTL: 50 * time.Millisecond,
+		StaleTTL: time.Hour,
+	})
+	fake.setHosts(healthyInstance("10.0.0.1", 8080, 1))
+	first, err := resolver.Resolve(context.Background(), "demo-service")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	fake.setFail(true)
+	time.Sleep(60 * time.Millisecond)
+	for i := 0; i < 100; i++ {
+		base, err := resolver.Resolve(context.Background(), "demo-service")
+		if err != nil {
+			t.Fatalf("Resolve[%d]: %v", i, err)
+		}
+		if base != first {
+			t.Fatalf("Resolve[%d] = %q, want stale %q", i, base, first)
+		}
+	}
+	if calls, _ := fake.snapshot(); calls != 2 {
+		t.Fatalf("list calls = %d, want 2 (one success, one throttled failure)", calls)
+	}
+}
+
+// A successful empty list replaces the old addresses at once and is cached for
+// CacheTTL: a deploy window must not turn every request into a Nacos query.
+// 成功的空列表立刻覆盖旧地址，并按 CacheTTL 缓存：发布窗口不该把每个请求都变成一次
+// Nacos 查询。
+func TestResolveNegativeCachesEmptyList(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		CacheTTL: 80 * time.Millisecond,
+		StaleTTL: time.Hour,
+	})
+	fake.setHosts(healthyInstance("10.0.0.1", 8080, 1))
+	if _, err := resolver.Resolve(context.Background(), "demo-service"); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	fake.setHosts()
+	// Wait for the positive entry to expire, otherwise the call is answered
+	// from cache and never sees the emptied registry.
+	// 等正向缓存过期，否则这次调用直接命中缓存，看不到已经清空的注册表。
+	time.Sleep(100 * time.Millisecond)
+	if _, err := resolver.Resolve(context.Background(), "demo-service"); !errors.Is(err, ErrNoInstances) {
+		t.Fatalf("err after emptying = %v, want ErrNoInstances", err)
+	}
+	if calls, _ := fake.snapshot(); calls != 2 {
+		t.Fatalf("list calls = %d, want 2", calls)
+	}
+	if _, err := resolver.Resolve(context.Background(), "demo-service"); !errors.Is(err, ErrNoInstances) {
+		t.Fatalf("err on empty cache hit = %v, want ErrNoInstances", err)
+	}
+	if calls, _ := fake.snapshot(); calls != 2 {
+		t.Fatalf("list calls = %d, want 2 within CacheTTL", calls)
+	}
+
+	// The next instance must be visible once the negative entry expires.
+	// 负缓存过期后必须能马上看到新实例。
+	fake.setHosts(healthyInstance("10.0.0.2", 8081, 1))
+	time.Sleep(100 * time.Millisecond)
+	base, err := resolver.Resolve(context.Background(), "demo-service")
+	if err != nil {
+		t.Fatalf("Resolve after recovery: %v", err)
+	}
+	if base != "http://10.0.0.2:8081" {
+		t.Fatalf("base = %q", base)
+	}
+}
+
+// A caller that gives up must not poison the cache: its cancellation says
+// nothing about Nacos, so the next caller has to retry immediately.
+// 调用方放弃不能污染缓存：它取消说明不了 Nacos 的状态，下一个调用方必须立刻重试。
+func TestResolveCancelDoesNotPoisonCache(t *testing.T) {
+	gate := newTestGate()
+	fake := &fakeNaming{
+		hosts:    []nacosconfig.Instance{healthyInstance("10.0.0.1", 8080, 1)},
+		listGate: gate,
+	}
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+	resolver, err := New(Config{Addr: server.URL, CacheTTL: time.Minute})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errs := make(chan error, 1)
+	go func() {
+		_, err := resolver.Resolve(ctx, "orders")
+		errs <- err
+	}()
+	<-gate.started
+	cancel()
+	if err := <-errs; err == nil {
+		t.Fatal("Resolve returned nil error for a cancelled caller")
+	}
+	close(gate.release)
+
+	base, err := resolver.Resolve(context.Background(), "orders")
+	if err != nil {
+		t.Fatalf("Resolve after cancel: %v", err)
+	}
+	if base != "http://10.0.0.1:8080" {
+		t.Fatalf("base = %q", base)
+	}
+	if calls, _ := fake.snapshot(); calls != 2 {
+		t.Fatalf("list calls = %d, want 2 (cancel must not be cached)", calls)
+	}
+}
+
+func TestNewRejectsStaleShorterThanCache(t *testing.T) {
+	_, err := New(Config{CacheTTL: time.Minute, StaleTTL: time.Second})
+	if !errors.Is(err, ErrStaleTTLShorterThanCache) {
+		t.Fatalf("err = %v, want ErrStaleTTLShorterThanCache", err)
+	}
+}
+
+func TestConfigFromNacosFallsBackToConnectionScope(t *testing.T) {
+	got := ConfigFromNacos(nacosconfig.Config{Namespace: "dev", Group: "gofy-group"})
+	if got.Namespace != "dev" || got.Group != "gofy-group" {
+		t.Fatalf("namespace/group = %q/%q, want the connection values", got.Namespace, got.Group)
+	}
+}
+
 func TestResolveExpiresStaleAfterStaleTTL(t *testing.T) {
 	resolver, fake := newTestResolver(t, Config{
 		CacheTTL: 10 * time.Millisecond,

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,6 +32,14 @@ type fakeNaming struct {
 	fail    bool
 	calls   int
 	queries []url.Values
+
+	// groupHosts, when non-nil, answers per group (keyed by groupName) instead
+	// of the flat hosts list. A resolver that forgets to pass the fallback
+	// group then reads the wrong set, and the test fails instead of passing by
+	// accident.
+	// groupHosts 非 nil 时按 groupName 分组返回，而不是使用扁平的 hosts。resolver 忘记
+	// 传兜底分组时会读到错的那一份，测试因此会失败而不是碰巧通过。
+	groupHosts map[string][]nacosconfig.Instance
 
 	// listGate, when set, blocks the first list request until released. It lets
 	// a test hold one refresh in flight while other Resolve calls pile up.
@@ -76,7 +85,11 @@ func (f *fakeNaming) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "boom", http.StatusServiceUnavailable)
 			return
 		}
-		payload, err := json.Marshal(map[string]any{"hosts": f.hosts})
+		hosts := f.hosts
+		if f.groupHosts != nil {
+			hosts = f.groupHosts[r.URL.Query().Get("groupName")]
+		}
+		payload, err := json.Marshal(map[string]any{"hosts": hosts})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -137,6 +150,32 @@ func (f *fakeNaming) setHosts(hosts ...nacosconfig.Instance) {
 	f.mu.Lock()
 	f.hosts = hosts
 	f.mu.Unlock()
+}
+
+// setGroup replaces one group's answer. Calling it with no hosts makes that
+// group answer "no instances".
+// setGroup 替换某个分组的返回；不传 hosts 即让该分组回答"没有实例"。
+func (f *fakeNaming) setGroup(group string, hosts ...nacosconfig.Instance) {
+	f.mu.Lock()
+	if f.groupHosts == nil {
+		f.groupHosts = make(map[string][]nacosconfig.Instance)
+	}
+	f.groupHosts[group] = hosts
+	f.mu.Unlock()
+}
+
+// groupCalls counts the list queries issued for one group.
+// groupCalls 统计某个分组被查询了几次。
+func (f *fakeNaming) groupCalls(group string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, q := range f.queries {
+		if q.Get("groupName") == group {
+			n++
+		}
+	}
+	return n
 }
 
 func (f *fakeNaming) setFail(fail bool) {
@@ -510,18 +549,24 @@ func TestBaseURLUsesSchemeMetadata(t *testing.T) {
 }
 
 func TestConfigFromNacosMapsDiscovery(t *testing.T) {
+	discovery := nacosconfig.DiscoveryConfig{
+		Group:           "gofy-group",
+		Namespace:       "dev",
+		LoadBalancer:    "weight",
+		CacheTTL:        30 * time.Second,
+		StaleTTL:        90 * time.Second,
+		Clusters:        []string{"DEFAULT"},
+		LocalAutoSwitch: true,
+	}
+	// A hand-built config must say so through the setter: assigning the field
+	// is indistinguishable from leaving the zero value.
+	// 手工构造的配置必须通过 setter 明确表态：只赋字段与留零值无法区分。
+	discovery.SetHealthyOnly(false)
 	cfg := nacosconfig.Config{
 		Addr:      "http://10.0.0.2:8848",
 		Namespace: "dev",
-		Discovery: nacosconfig.DiscoveryConfig{
-			Group:        "gofy-group",
-			Namespace:    "dev",
-			LoadBalancer: "weight",
-			CacheTTL:     30 * time.Second,
-			StaleTTL:     90 * time.Second,
-			HealthyOnly:  false,
-			Clusters:     []string{"DEFAULT"},
-		},
+		Register:  nacosconfig.RegisterConfig{Group: "GO_GROUP"},
+		Discovery: discovery,
 	}
 	got := ConfigFromNacos(cfg)
 	if got.Addr != "http://10.0.0.2:8848" || got.Namespace != "dev" || got.Group != "gofy-group" {
@@ -531,10 +576,50 @@ func TestConfigFromNacosMapsDiscovery(t *testing.T) {
 		t.Fatalf("discovery fields = %+v", got)
 	}
 	if !got.IncludeUnhealthy {
-		t.Fatal("IncludeUnhealthy = false, want true when HealthyOnly is false")
+		t.Fatal("IncludeUnhealthy = false, want true after SetHealthyOnly(false)")
 	}
 	if len(got.Clusters) != 1 || got.Clusters[0] != "DEFAULT" {
 		t.Fatalf("Clusters = %v", got.Clusters)
+	}
+	// The fallback group is where this process registers, and the switch comes
+	// from the discovery block: both must survive the mapping, otherwise the
+	// local-development fallback silently never runs.
+	// 兜底分组是本进程注册进去的那个分组，开关来自 discovery 段：两者都必须映射过去，
+	// 否则本地开发兜底会静默地永不生效。
+	if !got.LocalAutoSwitch || got.FallbackGroup != "GO_GROUP" {
+		t.Fatalf("fallback fields = %+v", got)
+	}
+}
+
+func TestConfigFromNacosZeroValueExcludesUnhealthy(t *testing.T) {
+	// The zero value of DiscoveryConfig means "not set", not "include
+	// unhealthy": a hand-built Config must not silently widen the candidate set.
+	// DiscoveryConfig 的零值表示"未设置"，不是"包含不健康实例"：手工构造的
+	// Config 不能悄悄扩大候选集。
+	got := ConfigFromNacos(nacosconfig.Config{})
+	if got.IncludeUnhealthy {
+		t.Fatal("IncludeUnhealthy = true for a zero-value Config, want false")
+	}
+}
+
+func TestConfigFromNacosExplicitHealthyOnly(t *testing.T) {
+	cases := []struct {
+		name          string
+		enabled       bool
+		wantUnhealthy bool
+	}{
+		{name: "explicit true", enabled: true, wantUnhealthy: false},
+		{name: "explicit false", enabled: false, wantUnhealthy: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			discovery := nacosconfig.DiscoveryConfig{}
+			discovery.SetHealthyOnly(tc.enabled)
+			got := ConfigFromNacos(nacosconfig.Config{Discovery: discovery})
+			if got.IncludeUnhealthy != tc.wantUnhealthy {
+				t.Fatalf("IncludeUnhealthy = %v, want %v", got.IncludeUnhealthy, tc.wantUnhealthy)
+			}
+		})
 	}
 }
 
@@ -572,5 +657,358 @@ func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A zero weight is a drain command, not an unset field: Nacos reports the
+// default as 1.0. The weight strategy must never hand it traffic.
+// 权重 0 是摘流指令而不是"没设置"：Nacos 会把默认值报成 1.0。weight 策略绝不能给它流量。
+func TestWeightStrategySkipsZeroWeight(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:    "dev",
+		LoadBalancer: "weight",
+		CacheTTL:     time.Minute,
+	})
+	fake.setHosts(healthyInstance("10.0.0.1", 8080, 100), healthyInstance("10.0.0.2", 8080, 0))
+
+	for i := 0; i < 200; i++ {
+		base, err := resolver.Resolve(context.Background(), "orders")
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		if base != "http://10.0.0.1:8080" {
+			t.Fatalf("pick %d returned drained instance %q", i, base)
+		}
+	}
+}
+
+// Negative weights are as ineligible as zero, and must not be normalised to 1.
+// 负权重与 0 一样没有资格，不能被归一到 1。
+func TestWeightStrategyExcludesNegativeWeight(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:    "dev",
+		LoadBalancer: "weight",
+		CacheTTL:     time.Minute,
+	})
+	fake.setHosts(healthyInstance("10.0.0.1", 8080, 3), healthyInstance("10.0.0.2", 8080, -5))
+
+	for i := 0; i < 100; i++ {
+		base, err := resolver.Resolve(context.Background(), "orders")
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		if base != "http://10.0.0.1:8080" {
+			t.Fatalf("pick %d returned negative-weight instance %q", i, base)
+		}
+	}
+}
+
+// Draining every instance is an operator action, not a missing field. The
+// resolver fails closed with a message that names the reason.
+// 把所有实例都摘流是运维动作、不是字段缺失。resolver 直接 fail-closed，并让错误信息
+// 点名原因。
+func TestWeightStrategyAllZeroFailsClosed(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:    "dev",
+		LoadBalancer: "weight",
+		CacheTTL:     time.Minute,
+	})
+	fake.setHosts(healthyInstance("10.0.0.1", 8080, 0), healthyInstance("10.0.0.2", 8080, 0))
+
+	_, err := resolver.Resolve(context.Background(), "orders")
+	if !errors.Is(err, ErrNoInstances) || !errors.Is(err, ErrAllZeroWeight) {
+		t.Fatalf("err = %v, want ErrNoInstances wrapping ErrAllZeroWeight", err)
+	}
+	if !strings.Contains(err.Error(), "weight 0") {
+		t.Fatalf("err = %v, want it to name the weight", err)
+	}
+}
+
+// An instance registered with inner_external_base_uri is reachable from outside
+// the cluster: when the local group is empty, the resolver must switch to the
+// deployment group and use that URL instead of the pod address.
+// 注册了 inner_external_base_uri 的实例从集群外可达：本地分组为空时，resolver 必须切到
+// 部署分组并使用该 URL，而不是 Pod 地址。
+func TestResolveFallsBackToDeploymentGroupUsingMetadata(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:       "dev",
+		Group:           "local",
+		FallbackGroup:   "GO_GROUP",
+		LocalAutoSwitch: true,
+		CacheTTL:        time.Minute,
+	})
+	fake.setGroup("local")
+	fake.setGroup("GO_GROUP", instanceWithMetadata("10.244.0.9", 8080, 1,
+		map[string]string{nacosconfig.MetadataInnerExternalBaseURI: "http://demo-dev.example.com:8080/"}))
+
+	var events []FallbackEvent
+	resolver.SetOnFallback(func(ev FallbackEvent) { events = append(events, ev) })
+
+	base, err := resolver.Resolve(context.Background(), "demo-service")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if base != "http://demo-dev.example.com:8080" {
+		t.Fatalf("base = %q, want the metadata URL without its trailing slash", base)
+	}
+	if fake.groupCalls("local") != 1 || fake.groupCalls("GO_GROUP") != 1 {
+		t.Fatalf("calls local/fallback = %d/%d, want 1/1",
+			fake.groupCalls("local"), fake.groupCalls("GO_GROUP"))
+	}
+	if len(events) != 1 {
+		t.Fatalf("fallback events = %d, want 1 per refresh", len(events))
+	}
+	if ev := events[0]; ev.Service != "demo-service" || ev.LocalGroup != "local" ||
+		ev.FallbackGroup != "GO_GROUP" || !ev.FromMetadata || ev.BaseURL != base {
+		t.Fatalf("event = %+v", ev)
+	}
+
+	// A cache hit must not emit a second event: the hook is per refresh.
+	// 缓存命中不能再发事件：钩子是"每次刷新一次"。
+	if _, err := resolver.Resolve(context.Background(), "demo-service"); err != nil {
+		t.Fatalf("cached Resolve: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("fallback events after cache hit = %d, want 1", len(events))
+	}
+}
+
+// Without the metadata the deployment instance is still usable: fall back to
+// its address rather than failing the lookup.
+// 没有该 metadata 时部署分组的实例照样可用：退到它的地址，而不是让解析失败。
+func TestResolveFallbackWithoutMetadataUsesAddress(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:       "dev",
+		Group:           "local",
+		FallbackGroup:   "GO_GROUP",
+		LocalAutoSwitch: true,
+		CacheTTL:        time.Minute,
+	})
+	fake.setGroup("local")
+	fake.setGroup("GO_GROUP", healthyInstance("10.244.0.9", 8080, 1))
+
+	var events []FallbackEvent
+	resolver.SetOnFallback(func(ev FallbackEvent) { events = append(events, ev) })
+
+	base, err := resolver.Resolve(context.Background(), "demo-service")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if base != "http://10.244.0.9:8080" {
+		t.Fatalf("base = %q", base)
+	}
+	if len(events) != 1 || events[0].FromMetadata {
+		t.Fatalf("events = %+v, want one with FromMetadata=false", events)
+	}
+}
+
+// A bad metadata value must not poison the whole lookup: it falls back to the
+// instance address, and the client's own validation never sees it.
+// 坏掉的 metadata 不能让整次解析失败：退到实例地址，客户端那层校验根本看不到它。
+func TestResolveFallbackIgnoresInvalidMetadata(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "not a url", value: "demo-dev.example.com:8080"},
+		{name: "wrong scheme", value: "ftp://demo-dev.example.com:8080"},
+		{name: "no host", value: "http:///path-only"},
+		{name: "with query", value: "http://demo-dev.example.com:8080/?x=1"},
+		{name: "with userinfo", value: "http://user:pass@demo-dev.example.com:8080"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resolver, fake := newTestResolver(t, Config{
+				Namespace:       "dev",
+				Group:           "local",
+				FallbackGroup:   "GO_GROUP",
+				LocalAutoSwitch: true,
+				CacheTTL:        time.Minute,
+			})
+			fake.setGroup("local")
+			fake.setGroup("GO_GROUP", instanceWithMetadata("10.244.0.9", 8080, 1,
+				map[string]string{nacosconfig.MetadataInnerExternalBaseURI: tc.value}))
+
+			base, err := resolver.Resolve(context.Background(), "demo-service")
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if base != "http://10.244.0.9:8080" {
+				t.Fatalf("base = %q, want the instance address", base)
+			}
+		})
+	}
+}
+
+// The switch is off by default: a cluster caller that happens to see an empty
+// group must not borrow the deployment group's instances.
+// 开关默认关闭：集群内的调用方即使看到空分组，也不能借用部署分组的实例。
+func TestResolveDoesNotSwitchWhenDisabled(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:     "dev",
+		Group:         "local",
+		FallbackGroup: "GO_GROUP",
+		CacheTTL:      time.Minute,
+	})
+	fake.setGroup("local")
+	fake.setGroup("GO_GROUP", healthyInstance("10.244.0.9", 8080, 1))
+
+	_, err := resolver.Resolve(context.Background(), "demo-service")
+	if !errors.Is(err, ErrNoInstances) {
+		t.Fatalf("err = %v, want ErrNoInstances", err)
+	}
+	if n := fake.groupCalls("GO_GROUP"); n != 0 {
+		t.Fatalf("fallback group queried %d times with the switch off", n)
+	}
+}
+
+// When both groups are the same there is nothing to switch to: query it once.
+// 两个分组相同时没有可切换的目标：只查一次。
+func TestResolveSkipsFallbackWhenGroupsMatch(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:       "dev",
+		Group:           "GO_GROUP",
+		FallbackGroup:   "GO_GROUP",
+		LocalAutoSwitch: true,
+		CacheTTL:        time.Minute,
+	})
+	fake.setGroup("GO_GROUP")
+
+	_, err := resolver.Resolve(context.Background(), "demo-service")
+	if !errors.Is(err, ErrNoInstances) {
+		t.Fatalf("err = %v, want ErrNoInstances", err)
+	}
+	if calls, _ := fake.snapshot(); calls != 1 {
+		t.Fatalf("list calls = %d, want 1", calls)
+	}
+}
+
+// A Nacos failure is not an empty group: both groups sit behind the same
+// registry, so the fallback must not be tried (it would only double the load).
+// Nacos 故障不等于"分组为空"：两个分组在同一个注册中心后面，兜底不该再查一次（只会
+// 让故障翻倍）。
+func TestResolveDoesNotSwitchOnNacosFailure(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:       "dev",
+		Group:           "local",
+		FallbackGroup:   "GO_GROUP",
+		LocalAutoSwitch: true,
+		CacheTTL:        time.Minute,
+	})
+	fake.setGroup("local")
+	fake.setGroup("GO_GROUP", healthyInstance("10.244.0.9", 8080, 1))
+	fake.setFail(true)
+
+	_, err := resolver.Resolve(context.Background(), "demo-service")
+	if err == nil {
+		t.Fatal("Resolve succeeded with a failing registry")
+	}
+	if errors.Is(err, ErrNoInstances) {
+		t.Fatalf("err = %v, want the registry failure rather than ErrNoInstances", err)
+	}
+	if n := fake.groupCalls("GO_GROUP"); n != 0 {
+		t.Fatalf("fallback group queried %d times during a registry failure", n)
+	}
+}
+
+// The switch must not be sticky: once the local group has instances again, the
+// next refresh uses them and stops borrowing the deployment group. This is what
+// the per-group cache key buys — a fallback result stored under the bare
+// service name would answer forever.
+// 切换不能有粘性：本地分组重新有实例后，下一次刷新就该用它、不再借部署分组。这正是
+// "按分组分键"带来的——把兜底结果存在裸服务名下会永远替本地作答。
+func TestResolveTriesLocalGroupAgainAfterSwitch(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:       "dev",
+		Group:           "local",
+		FallbackGroup:   "GO_GROUP",
+		LocalAutoSwitch: true,
+		CacheTTL:        40 * time.Millisecond,
+	})
+	fake.setGroup("local")
+	fake.setGroup("GO_GROUP", instanceWithMetadata("10.244.0.9", 8080, 1,
+		map[string]string{nacosconfig.MetadataInnerExternalBaseURI: "http://demo-dev.example.com:8080"}))
+
+	if base, err := resolver.Resolve(context.Background(), "demo-service"); err != nil ||
+		base != "http://demo-dev.example.com:8080" {
+		t.Fatalf("first Resolve = %q, %v", base, err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if _, err := resolver.Resolve(context.Background(), "demo-service"); err != nil {
+		t.Fatalf("second Resolve: %v", err)
+	}
+	if n := fake.groupCalls("local"); n < 2 {
+		t.Fatalf("local group queried %d times, want the expired empty entry to be retried", n)
+	}
+
+	// The local instances are back: the next refresh must use them.
+	// 本地实例回来了：下一次刷新必须用它们。
+	fake.setGroup("local", healthyInstance("10.0.0.5", 8080, 1))
+	time.Sleep(60 * time.Millisecond)
+	base, err := resolver.Resolve(context.Background(), "demo-service")
+	if err != nil {
+		t.Fatalf("third Resolve: %v", err)
+	}
+	if base != "http://10.0.0.5:8080" {
+		t.Fatalf("base = %q, want the local instance address", base)
+	}
+}
+
+// Both groups empty: the error has to name both, otherwise an operator sees
+// "no instances" and has no idea which group was consulted.
+// 两个分组都空：错误信息必须同时点名两者，否则运维只看到"没有实例"，不知道查过哪些分组。
+func TestResolveFallbackEmptyNamesBothGroups(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:       "dev",
+		Group:           "local",
+		FallbackGroup:   "GO_GROUP",
+		LocalAutoSwitch: true,
+		CacheTTL:        time.Minute,
+	})
+	fake.setGroup("local")
+	fake.setGroup("GO_GROUP")
+
+	_, err := resolver.Resolve(context.Background(), "demo-service")
+	if !errors.Is(err, ErrNoInstances) {
+		t.Fatalf("err = %v, want ErrNoInstances", err)
+	}
+	for _, want := range []string{"local", "GO_GROUP"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %v, want it to mention %q", err, want)
+		}
+	}
+}
+
+func instanceWithMetadata(ip string, port int, weight float64, metadata map[string]string) nacosconfig.Instance {
+	inst := healthyInstance(ip, port, weight)
+	inst.Metadata = metadata
+	return inst
+}
+
+// A drained local group is not an empty one: somebody deliberately took the
+// instances out of rotation, so borrowing the deployment group would defeat the
+// drain (and hide it).
+// 本地分组被摘流不等于"没有实例"：有人刻意把这些实例移出了轮转，此时借用部署分组会
+// 让摘流失效，还会把它藏起来。
+func TestResolveDoesNotSwitchWhenLocalGroupIsDrained(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:       "dev",
+		Group:           "local",
+		FallbackGroup:   "GO_GROUP",
+		LocalAutoSwitch: true,
+		LoadBalancer:    "weight",
+		CacheTTL:        time.Minute,
+	})
+	fake.setGroup("local", healthyInstance("10.0.0.1", 8080, 0))
+	fake.setGroup("GO_GROUP", instanceWithMetadata("10.244.0.9", 8080, 1,
+		map[string]string{nacosconfig.MetadataInnerExternalBaseURI: "http://demo-dev.example.com:8080"}))
+
+	_, err := resolver.Resolve(context.Background(), "demo-service")
+	if !errors.Is(err, ErrAllZeroWeight) {
+		t.Fatalf("err = %v, want ErrAllZeroWeight", err)
+	}
+	if n := fake.groupCalls("GO_GROUP"); n != 0 {
+		t.Fatalf("fallback group queried %d times for a drained local group", n)
 	}
 }

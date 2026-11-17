@@ -150,6 +150,19 @@ func TestBindGroupRejectsUnregisteredName(t *testing.T) {
 	}
 }
 
+func TestBindGroupRejectsInconsistentStampedPrefix(t *testing.T) {
+	_, r := newFixtureRouter()
+	// Fixture routes are stamped "/api/test" by their own group; declaring them
+	// under another prefix must fail before any route goes live.
+	// fixture 路由已被自己的分组写入 "/api/test"；换到另一个前缀下声明时必须在
+	// 路由上线前失败。
+	group := &endpoint.Group{Prefix: "/other", Routes: testcontract.Items.Routes}
+	err := gofyadapter.BindGroup(r, group, fixtureImpl{}, gofyadapter.BindOptions{})
+	if err == nil || !strings.Contains(err.Error(), "inconsistent route prefixes") {
+		t.Fatalf("BindGroup error = %v, want inconsistent route prefixes", err)
+	}
+}
+
 func TestAuthValidatorSeesGroupMiddlewareNames(t *testing.T) {
 	_, r := newFixtureRouter()
 	var seen [][]string

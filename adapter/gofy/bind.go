@@ -87,6 +87,9 @@ func BindGroup(
 	if group == nil {
 		return errors.New("gofyadapter: route group is required")
 	}
+	if err := checkGroupPrefix(group); err != nil {
+		return err
+	}
 	mw, err := resolveGroupMiddleware(r, group, opts)
 	if err != nil {
 		return err
@@ -98,6 +101,42 @@ func BindGroup(
 	// Required 路由被误判为“没有安装认证”。
 	opts.groupMiddleware = group.Middleware
 	return BindAll(r.Group(group.Prefix, mw...), group.Routes, impl, opts)
+}
+
+// checkGroupPrefix asserts that every route in the group carries the prefix
+// Group.Add stamped. A route belongs to one group: adding it to another group
+// overwrites Spec.Prefix, which would make the client and docgen build a path
+// different from the one this adapter binds, so the disagreement fails at
+// startup. Routes without a stamped prefix (added outside any group) are
+// skipped.
+// checkGroupPrefix 断言分组内每条路由都携带 Group.Add 写入的前缀。一条路由只
+// 属于一个分组：加入另一个分组会覆盖 Spec.Prefix，导致客户端与 docgen 生成的
+// 路径和 adapter 实际绑定不一致，因此启动期直接报错；没有 stamped 前缀的路由
+// （未加入任何分组）跳过检查。
+func checkGroupPrefix(group *endpoint.Group) error {
+	want := normalizeGroupPrefix(group.Prefix)
+	var problems []string
+	for _, desc := range group.Routes {
+		spec := desc.Spec()
+		got := normalizeGroupPrefix(spec.Prefix)
+		if got == "" || got == want {
+			continue
+		}
+		name := spec.OperationID
+		if name == "" {
+			name = spec.Method + " " + spec.Path
+		}
+		problems = append(problems,
+			fmt.Sprintf("%s: stamped prefix %q does not match group %q", name, spec.Prefix, group.Prefix))
+	}
+	if len(problems) > 0 {
+		return errors.New("gofyadapter: inconsistent route prefixes:\n  - " + strings.Join(problems, "\n  - "))
+	}
+	return nil
+}
+
+func normalizeGroupPrefix(prefix string) string {
+	return strings.TrimRight(strings.TrimSpace(prefix), "/")
 }
 
 // resolveGroupMiddleware maps the logical names declared by the group onto

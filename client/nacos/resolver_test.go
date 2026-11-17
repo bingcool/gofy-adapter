@@ -1012,3 +1012,140 @@ func TestResolveDoesNotSwitchWhenLocalGroupIsDrained(t *testing.T) {
 		t.Fatalf("fallback group queried %d times for a drained local group", n)
 	}
 }
+
+// Close is a lifecycle boundary: the cached lists and round-robin cursors are
+// dropped, and later calls report ErrClosed instead of querying a client whose
+// connections were released.
+// Close 是生命周期边界：缓存列表与轮询游标被丢弃，之后的调用返回 ErrClosed，而不是
+// 在连接已释放的客户端上继续查询。
+func TestResolveAfterCloseReturnsErrClosed(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		LoadBalancer: "round_robin",
+		CacheTTL:     time.Minute,
+	})
+	fake.setHosts(healthyInstance("10.0.0.1", 8080, 1))
+	if _, err := resolver.Resolve(context.Background(), "orders"); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	resolver.mu.Lock()
+	cacheSize, cursorSize := len(resolver.cache), len(resolver.rr)
+	resolver.mu.Unlock()
+	if cacheSize != 1 || cursorSize != 1 {
+		t.Fatalf("cache/rr = %d/%d, want 1/1 before Close", cacheSize, cursorSize)
+	}
+
+	if err := resolver.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	resolver.mu.Lock()
+	cacheSize, cursorSize = len(resolver.cache), len(resolver.rr)
+	resolver.mu.Unlock()
+	if cacheSize != 0 || cursorSize != 0 {
+		t.Fatalf("cache/rr = %d/%d after Close, want empty", cacheSize, cursorSize)
+	}
+	if _, err := resolver.Resolve(context.Background(), "orders"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("err = %v, want ErrClosed", err)
+	}
+	if calls, _ := fake.snapshot(); calls != 1 {
+		t.Fatalf("list calls = %d, want no call after Close", calls)
+	}
+	if err := resolver.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// A refresh that is already in flight when Close runs must not repopulate the
+// maps Close just cleared, and it must report ErrClosed instead of a
+// misleading "no instances".
+// Close 执行时仍在途的刷新不能重新填充它刚清空的 map，并且必须报 ErrClosed，
+// 而不是误导性的"没有实例"。
+func TestCloseDuringRefreshLeavesStateEmpty(t *testing.T) {
+	gate := newTestGate()
+	fake := &fakeNaming{
+		hosts:    []nacosconfig.Instance{healthyInstance("10.0.0.1", 8080, 1)},
+		listGate: gate,
+	}
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+	resolver, err := New(Config{Addr: server.URL, CacheTTL: time.Minute})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := resolver.Resolve(context.Background(), "orders")
+		done <- err
+	}()
+	<-gate.started
+	if err := resolver.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	close(gate.release)
+
+	if err := <-done; !errors.Is(err, ErrClosed) {
+		t.Fatalf("Resolve = %v, want ErrClosed", err)
+	}
+	resolver.mu.Lock()
+	cacheSize, inflightSize := len(resolver.cache), len(resolver.inflight)
+	resolver.mu.Unlock()
+	if cacheSize != 0 || inflightSize != 0 {
+		t.Fatalf("cache/inflight = %d/%d after Close, want empty", cacheSize, inflightSize)
+	}
+}
+
+// A slot whose stale window has passed can never answer again, so a later
+// refresh drops it: one-off service names must not grow the cache monotonically.
+// stale 窗口已过的槽不可能再作答，因此后续刷新会清掉它：一次性服务名不能让缓存
+// 单调增长。
+func TestResolverPrunesSlotsPastStaleTTL(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		LoadBalancer: "round_robin",
+		CacheTTL:     10 * time.Millisecond,
+		StaleTTL:     20 * time.Millisecond,
+	})
+	fake.setHosts(healthyInstance("10.0.0.1", 8080, 1))
+	if _, err := resolver.Resolve(context.Background(), "orders"); err != nil {
+		t.Fatalf("Resolve orders: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+
+	if _, err := resolver.Resolve(context.Background(), "products"); err != nil {
+		t.Fatalf("Resolve products: %v", err)
+	}
+
+	resolver.mu.Lock()
+	_, ordersKept := resolver.cache[cacheKey("orders", resolver.cfg.Group)]
+	cacheSize, cursorSize := len(resolver.cache), len(resolver.rr)
+	resolver.mu.Unlock()
+	if ordersKept {
+		t.Fatal("orders slot survived past StaleTTL")
+	}
+	if cacheSize != 1 || cursorSize != 1 {
+		t.Fatalf("cache/rr = %d/%d, want only the products slot", cacheSize, cursorSize)
+	}
+
+	// The pruned service must still resolve: it is refreshed, not blocked.
+	// 被清掉的服务仍可解析：它是回源刷新，而不是被拦下。
+	if _, err := resolver.Resolve(context.Background(), "orders"); err != nil {
+		t.Fatalf("Resolve orders again: %v", err)
+	}
+	if calls, _ := fake.snapshot(); calls != 3 {
+		t.Fatalf("list calls = %d, want 3", calls)
+	}
+}
+
+// Length-prefixed keys make the service/group split unambiguous: a service name
+// containing '@' must not share a slot with a different service whose group
+// happens to hold the rest of the string.
+// 长度前缀让 service/group 的切分无歧义：服务名带 '@' 时，不能与分组里恰好含有
+// 剩余字符的另一个服务共用槽。
+func TestCacheKeyDisambiguatesServiceAndGroup(t *testing.T) {
+	if cacheKey("a@b", "c") == cacheKey("a", "b@c") {
+		t.Fatal("cacheKey collides for values joined by '@'")
+	}
+	if cacheKey("orders", "local") == cacheKey("orders", "GO_GROUP") {
+		t.Fatal("cacheKey ignores the group")
+	}
+}

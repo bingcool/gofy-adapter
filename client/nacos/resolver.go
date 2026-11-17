@@ -64,6 +64,12 @@ var (
 	// 实例摘流，所以这是刻意的状态而不是字段缺失：宁可 fail-closed，也不要把流量发给
 	// 刚被摘流的实例。
 	ErrAllZeroWeight = errors.New("nacos resolver: all instances have weight 0")
+	// ErrClosed is returned by Resolve after Close. A resolver is process-scoped,
+	// so a late call is a lifecycle bug: reporting it is better than quietly
+	// querying through a client whose connections were already released.
+	// ErrClosed 在 Close 之后由 Resolve 返回。resolver 是进程级的，迟到的调用属于
+	// 生命周期错误：直接报出来，好过在连接已被释放的客户端上继续查询。
+	ErrClosed = errors.New("nacos resolver: closed")
 )
 
 // Config configures a Resolver. Connection fields mirror nacos.Config;
@@ -193,6 +199,12 @@ type Resolver struct {
 	mu    sync.Mutex
 	cache map[string]*entry
 	rr    map[string]uint64
+	// closed is guarded by mu. Close sets it together with clearing the maps,
+	// so a refresh that finishes afterwards cannot repopulate state nobody owns
+	// any more.
+	// closed 由 mu 保护。Close 在清空 map 的同时把它置位，之后完成的刷新无法再填充
+	// 已无人拥有的状态。
+	closed bool
 	// inflight holds one refresh per service+group so a cache expiry under a
 	// burst of Resolve calls triggers a single Nacos query. Callers that find a
 	// refresh already running wait for it and share the result instead of all
@@ -289,12 +301,27 @@ func New(cfg Config) (*Resolver, error) {
 	}, nil
 }
 
-// Close releases the idle connections held by the naming client. A resolver is
-// usually process-scoped, so this matters at shutdown and in tests.
-// Close 释放命名客户端持有的空闲连接。resolver 通常是进程级的，因此只在停机与测试
-// 里需要。
+// Close releases the idle connections held by the naming client, drops the
+// cached instance lists and round-robin cursors, and marks the resolver closed:
+// later Resolve calls return ErrClosed instead of querying through a client
+// whose connections were already released. It is idempotent.
+// Close 释放命名客户端持有的空闲连接，丢弃实例列表缓存与轮询游标，并把 resolver 标记
+// 为已关闭：之后的 Resolve 返回 ErrClosed，而不是在连接已释放的客户端上继续查询。
+// 重复调用是安全的。
 func (r *Resolver) Close() error {
-	if r == nil || r.client == nil {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	clear(r.cache)
+	clear(r.rr)
+	r.mu.Unlock()
+	if r.client == nil {
 		return nil
 	}
 	return r.client.Close()
@@ -356,10 +383,16 @@ func (r *Resolver) autoSwitchOn() bool {
 // cacheKey scopes a cache slot to both the service and the group. The group has
 // to be part of the key: a fallback result written under the bare service name
 // would keep answering for the local group, and the process would never notice
-// that its own instances came back.
+// that its own instances came back. The service is length-prefixed because it
+// is caller input: with a bare "@" separator, service "a@b" in group "c" and
+// service "a" in group "b@c" would share one slot.
 // cacheKey 把缓存槽限定到"服务 + 分组"。"分组"必须是键的一部分：把兜底结果写在裸服务名
-// 下，它会继续替本地分组作答，本进程也就永远不会发现自己的实例已经回来了。
-func cacheKey(service, group string) string { return service + "@" + group }
+// 下，它会继续替本地分组作答，本进程也就永远不会发现自己的实例已经回来了。服务名带长度
+// 前缀，因为它来自调用方：用裸 "@" 分隔时，分组 "c" 下的 "a@b" 与分组 "b@c" 下的 "a"
+// 会共用一个槽。
+func cacheKey(service, group string) string {
+	return strconv.Itoa(len(service)) + ":" + service + ":" + group
+}
 
 // groupResolution is one group's answer: the address, whether this call
 // refreshed it, whether the group said "no instances", and whether the address
@@ -435,6 +468,10 @@ func (r *Resolver) resolveInGroup(ctx context.Context, service, group string, fa
 	key := cacheKey(service, group)
 	now := time.Now()
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return groupResolution{}, fmt.Errorf("nacos resolver: %q: %w", service, ErrClosed)
+	}
 	if e := r.cache[key]; e != nil && now.Sub(e.lastAttempt) < r.cfg.CacheTTL {
 		base, fromMetadata, err := r.serveLocked(key, service, e, now, fallback)
 		r.mu.Unlock()
@@ -454,6 +491,10 @@ func (r *Resolver) resolveInGroup(ctx context.Context, service, group string, fa
 			return groupResolution{}, fmt.Errorf("nacos resolver: %q: waiting for refresh: %w", service, ctx.Err())
 		}
 		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return groupResolution{}, fmt.Errorf("nacos resolver: %q: %w", service, ErrClosed)
+		}
 		e, refreshErr := r.cache[key], rf.err
 		base, fromMetadata, err := r.serveLocked(key, service, e, time.Now(), fallback)
 		r.mu.Unlock()
@@ -479,6 +520,18 @@ func (r *Resolver) resolveInGroup(ctx context.Context, service, group string, fa
 	completed := time.Now()
 
 	r.mu.Lock()
+	if r.closed {
+		// Close won the race: leave the maps empty instead of repopulating the
+		// state it just dropped, and tell waiters the resolver is gone rather
+		// than "no instances".
+		// Close 抢先发生：让它刚丢弃的状态保持为空，而不是重新填充，并告诉等待者
+		// resolver 已关闭，而不是"没有实例"。
+		rf.err = ErrClosed
+		delete(r.inflight, key)
+		close(rf.done)
+		r.mu.Unlock()
+		return groupResolution{}, fmt.Errorf("nacos resolver: %q: %w", service, ErrClosed)
+	}
 	if listErr != nil && ctx.Err() != nil {
 		// The caller went away, so this attempt says nothing about Nacos:
 		// neither throttle the next caller nor overwrite the last good entry.
@@ -511,11 +564,29 @@ func (r *Resolver) resolveInGroup(ctx context.Context, service, group string, fa
 		}
 	}
 	r.cache[key] = e
+	r.pruneLocked(completed)
 	delete(r.inflight, key)
 	close(rf.done)
 	base, fromMetadata, err := r.serveLocked(key, service, e, completed, fallback)
 	r.mu.Unlock()
 	return groupResolution{base: base, refreshed: true, empty: groupEmpty(e, err), fromMetadata: fromMetadata}, err
+}
+
+// pruneLocked drops slots that can no longer answer anything: both timestamps
+// are older than StaleTTL, so even a caller arriving now would have to go back
+// to Nacos, and the stale list would not be served either. Without this a
+// caller passing ever-new service names would grow the cache forever; with it,
+// each such name occupies at most one StaleTTL window. The caller must hold r.mu.
+// pruneLocked 清掉已经不可能再回答任何请求的槽：两个时间戳都超过 StaleTTL，即使现在
+// 有调用方进来也必须回源，陈旧列表也不会再被返回。没有它，不断传入新服务名的调用方会
+// 让缓存无限增长；有了它，每个这样的名字最多占用一个 StaleTTL 窗口。调用方必须持有 r.mu。
+func (r *Resolver) pruneLocked(now time.Time) {
+	for key, e := range r.cache {
+		if now.Sub(e.lastAttempt) > r.cfg.StaleTTL && now.Sub(e.lastSuccess) > r.cfg.StaleTTL {
+			delete(r.cache, key)
+			delete(r.rr, key)
+		}
+	}
 }
 
 // serveLocked turns a cache entry into an address. It is the only place that

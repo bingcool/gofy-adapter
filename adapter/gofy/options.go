@@ -104,13 +104,20 @@ type BindOptions struct {
 	// none of it. The callback may defer external initialization: route binding
 	// can happen before dependencies such as Redis are ready, so actual I/O can
 	// wait until the middleware handles a request.
+	//
+	// The second argument is the Router's Responder, so the limiter rejects with
+	// the same error envelope the app's handlers use; without it a 429/503 would
+	// be rendered by a library default and diverge from the rest of the API.
 	// RateLimit 按契约声明构造限流中间件，只对 Spec.RateLimit 非 nil 的路由
 	// 调用，返回值安装在路由中间件链最前面（分组中间件之后，Global、路由
 	// 中间件名和 Routes[OperationID] 之前）；返回 nil 表示该路由不挂限流。
 	// 回调可以读取声明的全部字段，包括 RedisAlias——它只是服务端解析计数
 	// 存储的线索，adapter 不做解释。回调允许延迟初始化外部资源：路由绑定
 	// 可能早于 Redis 等依赖就绪，实际 I/O 可以放到中间件处理请求时。
-	RateLimit func(endpoint.Spec) support.Middleware
+	//
+	// 第二个参数是 Router 的 Responder，限流拒绝因此与 App 的 handler 使用同一个
+	// 错误信封；没有它时 429/503 会由库内默认 Responder 渲染，与其余接口不一致。
+	RateLimit func(endpoint.Spec, support.Responder) support.Middleware
 
 	// AuthValidator checks, after the middleware names of the route have
 	// resolved, whether the auth declaration matches the installed auth policy;

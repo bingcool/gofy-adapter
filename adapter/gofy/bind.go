@@ -289,7 +289,10 @@ func BindAll(
 func routeMiddleware(r *support.Router, spec endpoint.Spec, opts BindOptions) ([]support.Middleware, error) {
 	var mw []support.Middleware
 	if spec.RateLimit != nil && opts.RateLimit != nil {
-		if limiter := opts.RateLimit(spec); limiter != nil {
+		// The limiter rejects with the Router's responder, so its 429/503 carry
+		// the same envelope as every other route error.
+		// 限流拒绝使用 Router 的 responder，429/503 因此与其它路由错误共用同一信封。
+		if limiter := opts.RateLimit(spec, r.Responder()); limiter != nil {
 			mw = append(mw, limiter)
 		}
 	}

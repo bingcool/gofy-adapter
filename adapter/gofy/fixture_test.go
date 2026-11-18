@@ -117,6 +117,32 @@ func TestBindAllRejectsMissingDependencies(t *testing.T) {
 	}
 }
 
+// TestRateLimitHookReceivesRouterResponder pins F6's adapter half: the hook is
+// handed the Router's responder, so the limiter it builds rejects with the same
+// envelope as the handlers instead of a library default.
+// TestRateLimitHookReceivesRouterResponder 固定 F6 的 adapter 一侧：回调拿到 Router
+// 的 responder，它构建的限流因此与 handler 共用同一个信封，而不是库内默认值。
+func TestRateLimitHookReceivesRouterResponder(t *testing.T) {
+	_, r := newFixtureRouter()
+	want := r.Responder()
+	var got support.Responder
+	err := gofyadapter.BindAll(r, testcontract.Routes(), fixtureImpl{}, gofyadapter.BindOptions{
+		RateLimit: func(_ endpoint.Spec, responder support.Responder) support.Middleware {
+			got = responder
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("BindAll: %v", err)
+	}
+	if got == nil {
+		t.Fatal("the rate limit hook never ran")
+	}
+	if got != want {
+		t.Fatal("the hook received a responder other than the router's")
+	}
+}
+
 func TestBindGroupResolvesNamesInDeclarationOrder(t *testing.T) {
 	engine, r := newFixtureRouter()
 	var order []string

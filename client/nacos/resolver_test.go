@@ -547,6 +547,27 @@ func TestResolveRequiresServiceName(t *testing.T) {
 	}
 }
 
+// Resolver is an exported type, so a caller can construct a zero value or a
+// nil pointer without going through New. Resolve used to panic on the nil
+// client or nil inflight map; it must report a wiring error instead.
+// Resolver 是导出类型，调用方可以绕过 New 直接构造零值或 nil 指针。过去 Resolve 会因
+// nil client 或 nil inflight map 而 panic；现在必须报出装配错误。
+func TestResolveRejectsUninitializedResolver(t *testing.T) {
+	cases := map[string]*Resolver{
+		"nil":  nil,
+		"zero": {},
+	}
+	for name, r := range cases {
+		t.Run(name, func(t *testing.T) {
+			for _, service := range []string{"orders", ""} {
+				if _, err := r.Resolve(context.Background(), service); !errors.Is(err, ErrNotInitialized) {
+					t.Fatalf("Resolve(%q) error = %v, want ErrNotInitialized", service, err)
+				}
+			}
+		})
+	}
+}
+
 func TestNewRejectsUnknownLoadBalancer(t *testing.T) {
 	if _, err := New(Config{LoadBalancer: "hash"}); !errors.Is(err, ErrUnknownLoadBalancer) {
 		t.Fatalf("err = %v, want ErrUnknownLoadBalancer", err)

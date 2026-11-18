@@ -71,6 +71,14 @@ var (
 	// ErrClosed 在 Close 之后由 Resolve 返回。resolver 是进程级的，迟到的调用属于
 	// 生命周期错误：直接报出来，好过在连接已被释放的客户端上继续查询。
 	ErrClosed = errors.New("nacos resolver: closed")
+	// ErrNotInitialized means the Resolver was built without New/NewFromFiles
+	// (a zero value or a nil pointer). Resolve used to panic on the nil client
+	// or the nil inflight map in that case; a usable error lets callers handle
+	// a wiring mistake at the call site instead of crashing the process.
+	// ErrNotInitialized 表示 Resolver 不是由 New/NewFromFiles 构造的（零值或 nil 指针）。
+	// 过去 Resolve 在这时会因 nil client 或 nil inflight map 而 panic；返回可用错误让调用方
+	// 在调用点发现装配错误，而不是把进程打崩。
+	ErrNotInitialized = errors.New("nacos resolver: not initialized; use New or NewFromFiles")
 )
 
 // Config configures a Resolver. Connection fields mirror nacos.Config;
@@ -475,6 +483,15 @@ func groupEmpty(e *entry, err error) bool {
 // Resolve 实现 client.Resolver：先用本地分组选址；本地分组明确回答"没有实例"且打开了
 // 本地自动切换时，再按部署分组选址，并优先使用实例发布的外部地址元数据。
 func (r *Resolver) Resolve(ctx context.Context, service string) (string, error) {
+	// A zero or nil Resolver can be built by any caller because the type is
+	// exported. Check readiness before touching any field: resolveInGroup
+	// writes to r.inflight and list dereferences r.client, either of which
+	// would panic on a zero value.
+	// Resolver 是导出类型，调用方可能直接构造零值或 nil。先检查就绪状态再访问字段：
+	// resolveInGroup 会写 r.inflight，list 会解引用 r.client，零值下两者都会 panic。
+	if r == nil || r.client == nil || r.cache == nil || r.inflight == nil {
+		return "", ErrNotInitialized
+	}
 	service = strings.TrimSpace(service)
 	if service == "" {
 		return "", errors.New("nacos resolver: service name is required")

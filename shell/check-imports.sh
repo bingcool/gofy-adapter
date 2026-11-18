@@ -7,7 +7,13 @@ python3 - <<'PY'
 import pathlib, re, sys
 
 FORBIDDEN_PREFIXES = (
-    "github.com/yourorg/",                              # project contract modules
+    # The sibling example projects really use these module paths (see
+    # examples/*/go.mod); the adapter is generic and must not depend on a
+    # consumer's app code or contracts.
+    # 同仓库的示例项目确实使用这两个模块路径（见 examples/*/go.mod）；适配层是
+    # 通用模块，不得依赖使用方的应用代码或契约。
+    "github.com/yourorg/demo-service",
+    "github.com/yourorg/interface-service",
     "github.com/bingcool/gofy-interface-api/adapter",  # moved into this module
     "github.com/bingcool/gofy-interface-api/client/nacos",
 )
@@ -17,23 +23,30 @@ ALLOWED_EXTERNAL = (
     "github.com/getkin/kin-openapi",
     "github.com/swaggest/swgui",
     "gopkg.in/yaml.v3",
-    # adapter/lease/k8slease: the Kubernetes lock lives here precisely so the
-    # core module does not have to carry client-go.
-    # adapter/lease/k8slease 用的客户端放在这里，核心模块因此不必背 client-go。
+)
+# Only the Kubernetes lease adapter may pull in k8s.io. Scoping the allowlist
+# to that directory keeps client-go from leaking into the rest of the module.
+# 只有 Kubernetes 租约适配器可以引入 k8s.io；白名单限定在该目录，client-go 不会
+# 渗到模块的其他部分。
+ALLOWED_K8S_EXTERNAL = (
     "k8s.io/client-go",
     "k8s.io/api",
     "k8s.io/apimachinery",
 )
+K8S_LEASE_DIR = "adapter/lease/k8slease/"
 
 problems = []
 for f in sorted(pathlib.Path(".").rglob("*.go")):
     if ".git" in f.parts:
         continue
     text = f.read_text()
+    allowed = ALLOWED_EXTERNAL
+    if f.as_posix().startswith(K8S_LEASE_DIR):
+        allowed = ALLOWED_EXTERNAL + ALLOWED_K8S_EXTERNAL
     for imp in re.findall(r'^\s*(?:[\w.]+\s+)*"([^"]+)"', text, re.M):
         if imp.startswith(FORBIDDEN_PREFIXES):
             problems.append(f"{f}: forbidden import {imp}")
-        if "." in imp.split("/")[0] and not imp.startswith(ALLOWED_EXTERNAL):
+        if "." in imp.split("/")[0] and not imp.startswith(allowed):
             problems.append(f"{f}: unexpected external import {imp}")
     if re.search(r"(?m)^func init\(\)", text):
         problems.append(f"{f}: init() is not allowed")

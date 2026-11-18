@@ -41,6 +41,12 @@ type fakeNaming struct {
 	// 传兜底分组时会读到错的那一份，测试因此会失败而不是碰巧通过。
 	groupHosts map[string][]nacosconfig.Instance
 
+	// failGroups fails one group's list requests while the others keep working,
+	// which is how a per-group registry failure is modelled.
+	// failGroups 让单个分组的列表请求失败，其他分组照常工作，用来模拟按分组发生的
+	// 注册中心故障。
+	failGroups map[string]bool
+
 	// listGate, when set, blocks the first list request until released. It lets
 	// a test hold one refresh in flight while other Resolve calls pile up.
 	// listGate 设置后会阻塞第一次 list 请求直到被释放，用于让一个刷新保持在途、
@@ -81,7 +87,7 @@ func (f *fakeNaming) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case testListPath:
 		f.calls++
 		f.queries = append(f.queries, r.URL.Query())
-		if f.fail {
+		if f.fail || f.failGroups[r.URL.Query().Get("groupName")] {
 			http.Error(w, "boom", http.StatusServiceUnavailable)
 			return
 		}
@@ -181,6 +187,17 @@ func (f *fakeNaming) groupCalls(group string) int {
 func (f *fakeNaming) setFail(fail bool) {
 	f.mu.Lock()
 	f.fail = fail
+	f.mu.Unlock()
+}
+
+// setGroupFail fails or recovers one group's list requests.
+// setGroupFail 让某个分组的列表请求失败或恢复。
+func (f *fakeNaming) setGroupFail(group string, fail bool) {
+	f.mu.Lock()
+	if f.failGroups == nil {
+		f.failGroups = make(map[string]bool)
+	}
+	f.failGroups[group] = fail
 	f.mu.Unlock()
 }
 
@@ -441,10 +458,13 @@ func TestResolveNegativeCachesEmptyList(t *testing.T) {
 	}
 }
 
-// A caller that gives up must not poison the cache: its cancellation says
-// nothing about Nacos, so the next caller has to retry immediately.
-// 调用方放弃不能污染缓存：它取消说明不了 Nacos 的状态，下一个调用方必须立刻重试。
-func TestResolveCancelDoesNotPoisonCache(t *testing.T) {
+// A caller that gives up must not abort the shared refresh: the leader keeps
+// the lookup running for waiters and later callers on a detached context, then
+// reports the cancellation to its own caller. The result is a genuine Nacos
+// answer, so it is cached once.
+// 调用方放弃不能中断共享刷新：leader 在分离的 context 上继续为等待者与后续调用完成
+// 查询，然后只把自己的取消报给该调用方。结果是真实的 Nacos 应答，因此缓存一次。
+func TestResolveCancelDoesNotAbortTheSharedRefresh(t *testing.T) {
 	gate := newTestGate()
 	fake := &fakeNaming{
 		hosts:    []nacosconfig.Instance{healthyInstance("10.0.0.1", 8080, 1)},
@@ -465,11 +485,11 @@ func TestResolveCancelDoesNotPoisonCache(t *testing.T) {
 	}()
 	<-gate.started
 	cancel()
-	if err := <-errs; err == nil {
-		t.Fatal("Resolve returned nil error for a cancelled caller")
-	}
 	close(gate.release)
 
+	if err := <-errs; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Resolve = %v, want context.Canceled", err)
+	}
 	base, err := resolver.Resolve(context.Background(), "orders")
 	if err != nil {
 		t.Fatalf("Resolve after cancel: %v", err)
@@ -477,8 +497,8 @@ func TestResolveCancelDoesNotPoisonCache(t *testing.T) {
 	if base != "http://10.0.0.1:8080" {
 		t.Fatalf("base = %q", base)
 	}
-	if calls, _ := fake.snapshot(); calls != 2 {
-		t.Fatalf("list calls = %d, want 2 (cancel must not be cached)", calls)
+	if calls, _ := fake.snapshot(); calls != 1 {
+		t.Fatalf("list calls = %d, want 1 (the detached refresh is shared)", calls)
 	}
 }
 
@@ -1147,5 +1167,150 @@ func TestCacheKeyDisambiguatesServiceAndGroup(t *testing.T) {
 	}
 	if cacheKey("orders", "local") == cacheKey("orders", "GO_GROUP") {
 		t.Fatal("cacheKey ignores the group")
+	}
+}
+
+// Draining must mean the same thing under every strategy. The default random
+// strategy used to ignore weight entirely, so a drained instance kept receiving
+// traffic until an operator also switched load_balancer.
+// 摘流在每种策略下必须是同一个意思。默认的 random 策略过去完全忽略 weight，被摘流的
+// 实例会一直收到流量，直到运维把 load_balancer 也改掉。
+func TestRandomStrategySkipsDrainedInstances(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{Namespace: "dev", CacheTTL: time.Minute})
+	fake.setHosts(healthyInstance("10.0.0.1", 8080, 1), healthyInstance("10.0.0.2", 8080, 0))
+
+	for i := 0; i < 100; i++ {
+		base, err := resolver.Resolve(context.Background(), "orders")
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		if base != "http://10.0.0.1:8080" {
+			t.Fatalf("pick %d returned drained instance %q", i, base)
+		}
+	}
+}
+
+// The same rule applies to round_robin: the drained instance must not appear in
+// the rotation at all.
+// 同一条规则适用于 round_robin：被摘流的实例根本不应出现在轮转里。
+func TestRoundRobinSkipsDrainedInstances(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:    "dev",
+		LoadBalancer: "round_robin",
+		CacheTTL:     time.Minute,
+	})
+	fake.setHosts(
+		healthyInstance("10.0.0.1", 8080, 1),
+		healthyInstance("10.0.0.2", 8080, 0),
+		healthyInstance("10.0.0.3", 8080, 1),
+	)
+
+	want := []string{"http://10.0.0.1:8080", "http://10.0.0.3:8080"}
+	for i := 0; i < 10; i++ {
+		base, err := resolver.Resolve(context.Background(), "orders")
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		if base != want[i%len(want)] {
+			t.Fatalf("pick %d = %q, want %q", i, base, want[i%len(want)])
+		}
+	}
+}
+
+// A fully drained local group is still not an empty one under the default
+// strategy: the fallback group must not rescue a deliberate drain.
+// 在默认策略下，被全部摘流的本地分组仍然不等于"空分组"：兜底分组不能拯救一次刻意的
+// 摘流。
+func TestRandomStrategyAllDrainedDoesNotFallBack(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:       "dev",
+		Group:           "local",
+		FallbackGroup:   "GO_GROUP",
+		LocalAutoSwitch: true,
+		CacheTTL:        time.Minute,
+	})
+	fake.setGroup("local", healthyInstance("10.0.0.1", 8080, 0))
+	fake.setGroup("GO_GROUP", healthyInstance("10.244.0.9", 8080, 1))
+
+	_, err := resolver.Resolve(context.Background(), "demo-service")
+	if !errors.Is(err, ErrAllZeroWeight) {
+		t.Fatalf("err = %v, want ErrAllZeroWeight", err)
+	}
+	if n := fake.groupCalls("GO_GROUP"); n != 0 {
+		t.Fatalf("fallback group queried %d times for a drained local group", n)
+	}
+}
+
+// A failed refresh whose outage StaleTTL masks must still be reported once, and
+// only once per refresh: the event is what keeps a hidden outage visible.
+// 被 StaleTTL 掩盖的刷新失败仍必须上报一次，且每次刷新只报一次：事件是隐藏故障保持
+// 可见的唯一途径。
+func TestRefreshFailureEventReportsMaskedOutage(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		CacheTTL: 10 * time.Millisecond,
+		StaleTTL: time.Hour,
+	})
+	fake.setHosts(healthyInstance("10.0.0.1", 8080, 1))
+	first, err := resolver.Resolve(context.Background(), "orders")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	var events []RefreshFailureEvent
+	resolver.SetOnRefreshFailure(func(ev RefreshFailureEvent) { events = append(events, ev) })
+
+	fake.setFail(true)
+	time.Sleep(20 * time.Millisecond)
+	base, err := resolver.Resolve(context.Background(), "orders")
+	if err != nil {
+		t.Fatalf("stale Resolve: %v", err)
+	}
+	if base != first {
+		t.Fatalf("base = %q, want stale %q", base, first)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1 per failed refresh", len(events))
+	}
+	ev := events[0]
+	if ev.Service != "orders" || !ev.StaleServed || ev.Err == nil {
+		t.Fatalf("event = %+v", ev)
+	}
+
+	// The throttled cache hit must not fire a second event.
+	// 被节流的缓存命中不能再次触发事件。
+	if _, err := resolver.Resolve(context.Background(), "orders"); err != nil {
+		t.Fatalf("cached Resolve: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events after cache hit = %d, want 1", len(events))
+	}
+}
+
+// A registry failure in the fallback group must not masquerade as "no
+// instances": callers branch on ErrNoInstances, and a misreported outage would
+// hide itself behind their degradation path.
+// 兜底分组的注册中心故障不能伪装成"没有实例"：调用方会按 ErrNoInstances 分支，错误
+// 归类会把故障藏进它们的降级路径里。
+func TestFallbackRegistryFailureIsNotErrNoInstances(t *testing.T) {
+	resolver, fake := newTestResolver(t, Config{
+		Namespace:       "dev",
+		Group:           "local",
+		FallbackGroup:   "GO_GROUP",
+		LocalAutoSwitch: true,
+		CacheTTL:        time.Minute,
+	})
+	fake.setGroup("local")
+	fake.setGroup("GO_GROUP", healthyInstance("10.244.0.9", 8080, 1))
+	fake.setGroupFail("GO_GROUP", true)
+
+	_, err := resolver.Resolve(context.Background(), "demo-service")
+	if err == nil {
+		t.Fatal("Resolve succeeded while the fallback registry was failing")
+	}
+	if errors.Is(err, ErrNoInstances) {
+		t.Fatalf("err = %v, want the registry failure rather than ErrNoInstances", err)
+	}
+	if !strings.Contains(err.Error(), "fallback group") {
+		t.Fatalf("err = %v, want it to name the fallback group", err)
 	}
 }

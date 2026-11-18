@@ -1,4 +1,4 @@
-# apicore/client/nacos
+# client/nacos
 
 Nacos 服务发现实现，用于把服务名解析成 `client.Resolver` 需要的 `base_uri`。
 服务端由 gofy 的 `gofy.WithNacosRegistration` 注册后，本包负责读取实例列表、
@@ -88,23 +88,45 @@ orders, err := demoserviceclient.NewWithBaseURL("10.0.0.5:8080")
    超过 `StaleTTL` 才返回错误；
 5. 实例地址默认为 `http://ip:port`；实例 `metadata.scheme=https` 时使用 `https`。
 
-负载均衡在 `Resolver` 内完成：
+调度在 `Resolver` 内完成：
 
 - `random`：随机选择；
 - `round_robin`：按服务名维护递增计数；
-- `weight`：按实例 `weight` 加权随机，`weight<=0` 视为 1。
+- `weight`：按实例 `weight` 加权随机。
+
+`weight<=0` 表示运维摘流，对**所有**策略一致生效：随机与轮询同样跳过被摘流的
+实例，全部实例都被摘流时返回 `ErrAllZeroWeight`，也不会改查兜底分组——摘流是
+刻意动作，不能被另一个环境兜走。
 
 `client.Client` 不缓存单个实例地址：每次调用都会再走一次 `Resolve`，由本包按
 `CacheTTL` 决定是否访问 Nacos，并重新执行负载均衡。GET/HEAD/OPTIONS/DELETE 或带
 `Idempotency-Key` 的请求在传输错误、502/503/504 重试时同样会重新解析，因此一次调用
 可能切换到另一个实例；固定地址模式不解析，也不会切换。
 
+## 可观测性
+
+- `SetOnFallback`：每次切换到兜底分组并成功选址时投递一次 `FallbackEvent`；
+- `SetOnRefreshFailure`：每次实例列表刷新失败时投递一次 `RefreshFailureEvent`，
+  即使陈旧列表仍在作答（`StaleServed=true`）也照常投递。`StaleTTL` 会把 Nacos
+  故障从响应里藏起来，这个事件是故障保持可见的唯一途径；投递频率由 `CacheTTL`
+  节流限制为每个窗口最多一次，可以放心接到 logger。
+
+刷新在分离的 context（`WithoutCancel` + 发现超时）上执行：leader 的调用方取消不会
+中断整轮查询，结果仍会发布给共享这次刷新的等待者与后续调用；只有 leader 自己收到
+自己的取消错误。
+
 ## 错误
 
 | 错误 | 含义 |
 | --- | --- |
 | `ErrNoInstances` | 当前没有可用实例（包括全部被健康过滤掉） |
+| `ErrAllZeroWeight` | 实例都还在，但全部被摘流（`weight<=0`） |
+| `ErrStaleExpired` | Nacos 持续失败，且最后一次成功列表已超过 `StaleTTL` |
+| `ErrClosed` | `Resolver.Close` 之后仍调用 `Resolve` |
 | `ErrUnknownLoadBalancer` | `LoadBalancer` 不是支持的策略 |
+
+兜底分组失败时，兜底错误作为最外层 `%w` 返回：注册中心故障不会被报成
+`ErrNoInstances`，按该错误降级的调用方不会把故障藏起来。
 
 解析失败时错误会带上服务名，例如 `nacos resolver: "demo-service": ...`，
 便于和 `client.APIError` 区分：前者是寻址失败，后者是业务响应码非 0。
@@ -121,11 +143,12 @@ orders, err := demoserviceclient.NewWithBaseURL("10.0.0.5:8080")
 ## 测试
 
 - `resolver_test.go`：使用假 Nacos 覆盖缓存、陈旧回退、健康过滤、三种负载均衡、
+  摘流实例统一跳过、兜底注册中心故障的错误归属、`RefreshFailureEvent`、
   scheme metadata、`NewFromFiles` 配置映射；
 - `registration_test.go`：端到端串联 gofy 的 `Registrar` → 本包 `Resolver` →
   `demoserviceclient` 类型化调用 → 注销后返回 `ErrNoInstances`。
 
 ```bash
-go test ./apicore/client/...
-go test -race ./apicore/client/nacos/
+go test ./client/...
+go test -race ./client/nacos/
 ```

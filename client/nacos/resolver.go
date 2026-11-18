@@ -56,13 +56,14 @@ var (
 	// ErrStaleExpired 表示没有可用地址了：Nacos 不可达（或持续失败），且最近一次成功
 	// 的列表已经超过 StaleTTL。若存在被包装的错误，那是最近一次失败原因。
 	ErrStaleExpired = errors.New("nacos resolver: cached instances expired")
-	// ErrAllZeroWeight means the strategy is weight but every candidate has
-	// weight <= 0. Nacos uses weight 0 to drain an instance, so this is a
-	// deliberate state rather than a missing field: fail closed instead of
-	// sending traffic to instances somebody just drained.
-	// ErrAllZeroWeight 表示策略是 weight、但所有候选的权重都 <= 0。Nacos 用权重 0 给
-	// 实例摘流，所以这是刻意的状态而不是字段缺失：宁可 fail-closed，也不要把流量发给
-	// 刚被摘流的实例。
+	// ErrAllZeroWeight means every instance was drained (weight <= 0). Nacos
+	// uses weight 0 to take an instance out of rotation, so this is a deliberate
+	// state rather than a missing field: fail closed instead of sending traffic
+	// to instances somebody just drained. The rule applies to every strategy,
+	// not only weight.
+	// ErrAllZeroWeight 表示所有实例都被摘流（weight <= 0）。Nacos 用权重 0 给实例摘流，
+	// 所以这是刻意的状态而不是字段缺失：宁可 fail-closed，也不要把流量发给刚被摘流的
+	// 实例。该规则对所有策略生效，不只是 weight。
 	ErrAllZeroWeight = errors.New("nacos resolver: all instances have weight 0")
 	// ErrClosed is returned by Resolve after Close. A resolver is process-scoped,
 	// so a late call is a lifecycle bug: reporting it is better than quietly
@@ -221,14 +222,20 @@ type Resolver struct {
 	// goroutine, hence the atomic pointer rather than a plain field.
 	// onFallback 在装配期设置一次、在解析 goroutine 上读取，因此用原子指针而不是普通字段。
 	onFallback atomic.Pointer[func(FallbackEvent)]
+
+	// onRefreshFailure follows the same lifecycle as onFallback.
+	// onRefreshFailure 与 onFallback 同生命周期。
+	onRefreshFailure atomic.Pointer[func(RefreshFailureEvent)]
 }
 
 // refresh is one in-flight Nacos lookup for a service+group. Closing done publishes
 // the outcome: waiters then read the cache entry the leader wrote. err is only
-// set when the leader gave up because its own caller went away — the one case
-// where no cache entry is written at all.
+// set when the resolver was closed mid-refresh — the one case where no cache
+// entry is written at all. The refresh itself runs on a detached context, so a
+// leader whose own caller went away still publishes for its waiters.
 // refresh 是某个 service 的一次在途查询；关闭 done 即发布结果：等待者随后读取 leader
-// 写入的缓存条目。只有 leader 因自身调用方取消而放弃、根本没写缓存时，err 才有值。
+// 写入的缓存条目。只有刷新中途 resolver 被 Close、根本没写缓存时，err 才有值。刷新本身
+// 跑在分离的 context 上，因此 leader 的调用方离开后，它仍然会为等待者发布结果。
 type refresh struct {
 	done chan struct{}
 	err  error
@@ -371,6 +378,52 @@ func (r *Resolver) fireFallback(ev FallbackEvent) {
 	}
 }
 
+// RefreshFailureEvent reports one failed instance-list refresh. The leader
+// delivers it once per refresh attempt, even when a stale list still answers
+// the callers: StaleTTL hides the outage from responses, so this event is the
+// one place it stays visible. The CacheTTL throttle keeps it to at most one
+// event per window, which is what makes it safe to wire to a logger.
+// RefreshFailureEvent 报告一次失败的实例列表刷新。leader 每次刷新尝试投递一次，
+// 即使陈旧列表仍在为调用方作答也照常投递：StaleTTL 会把故障从响应里藏起来，这个
+// 事件是它唯一仍然可见的地方。CacheTTL 节流保证每个窗口最多一次，因此可以放心接到
+// logger。
+type RefreshFailureEvent struct {
+	// Service is the service whose refresh failed.
+	// Service 是刷新失败的服务名。
+	Service string
+	// Group is the group that was queried.
+	// Group 是本次查询的分组。
+	Group string
+	// Err is the failure Nacos reported.
+	// Err 是 Nacos 报告的失败原因。
+	Err error
+	// StaleServed reports whether the previous good list still answered, which
+	// means the failure stayed invisible to the callers.
+	// StaleServed 表示上一次成功列表仍在作答，也就是故障对调用方不可见。
+	StaleServed bool
+}
+
+// SetOnRefreshFailure installs the callback for failed refreshes. Call it at
+// assembly time, before the first Resolve; nil removes it.
+// SetOnRefreshFailure 设置刷新失败的回调。应在装配期、首次 Resolve 之前调用；传 nil
+// 即移除。
+func (r *Resolver) SetOnRefreshFailure(fn func(RefreshFailureEvent)) {
+	if r == nil {
+		return
+	}
+	if fn == nil {
+		r.onRefreshFailure.Store(nil)
+		return
+	}
+	r.onRefreshFailure.Store(&fn)
+}
+
+func (r *Resolver) fireRefreshFailure(ev RefreshFailureEvent) {
+	if p := r.onRefreshFailure.Load(); p != nil && *p != nil {
+		(*p)(ev)
+	}
+}
+
 // autoSwitchOn reports whether a second group may be tried at all: the switch
 // must be on and a different group must be configured.
 // autoSwitchOn 表示是否允许再试一个分组：开关打开，且配置了不同于本地分组的分组。
@@ -442,8 +495,13 @@ func (r *Resolver) Resolve(ctx context.Context, service string) (string, error) 
 
 	fb, fbErr := r.resolveInGroup(ctx, service, r.cfg.FallbackGroup, true)
 	if fbErr != nil {
-		return "", fmt.Errorf("%w: %q (local group %q is empty; fallback group %q: %w)",
-			ErrNoInstances, service, r.cfg.Group, r.cfg.FallbackGroup, fbErr)
+		// The fallback error is the outermost %w. Wrapping it under
+		// ErrNoInstances would report a registry outage as "no instances", and a
+		// caller that degrades on ErrNoInstances would hide the outage instead.
+		// fbErr 作为最外层 %w。把它包在 ErrNoInstances 下面会把注册中心故障报成
+		// "没有实例"，按 ErrNoInstances 降级的调用方就会把故障藏起来。
+		return "", fmt.Errorf("%w: %q (local group %q is empty; fallback group %q)",
+			fbErr, service, r.cfg.Group, r.cfg.FallbackGroup)
 	}
 	if fb.refreshed {
 		r.fireFallback(FallbackEvent{
@@ -513,7 +571,17 @@ func (r *Resolver) resolveInGroup(ctx context.Context, service, group string, fa
 	r.inflight[key] = rf
 	r.mu.Unlock()
 
-	instances, listErr := r.list(ctx, service, group)
+	// The refresh answers every waiter sharing this flight, so it must not be
+	// bound to one caller's cancellation: WithoutCancel keeps the context
+	// values, WithTimeout still bounds the attempt by the discovery timeout. A
+	// leader whose caller left early publishes the result for the others and
+	// then reports its own cancellation.
+	// 这次刷新为共享该在途的所有等待者作答，因此不能绑定某一个调用方的取消：
+	// WithoutCancel 保留 context value，WithTimeout 仍按发现超时限制本次尝试。
+	// leader 的调用方提前离开时，结果照样发布给其他等待者，随后 leader 才报告自己的取消。
+	refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), r.cfg.Timeout)
+	instances, listErr := r.list(refreshCtx, service, group)
+	cancelRefresh()
 	if listErr == nil {
 		instances = r.filter(instances)
 	}
@@ -531,17 +599,6 @@ func (r *Resolver) resolveInGroup(ctx context.Context, service, group string, fa
 		close(rf.done)
 		r.mu.Unlock()
 		return groupResolution{}, fmt.Errorf("nacos resolver: %q: %w", service, ErrClosed)
-	}
-	if listErr != nil && ctx.Err() != nil {
-		// The caller went away, so this attempt says nothing about Nacos:
-		// neither throttle the next caller nor overwrite the last good entry.
-		// 调用方已经离开，这次尝试说明不了 Nacos 的状态：既不节流下一个调用方，也不
-		// 覆盖上一条可用记录。
-		rf.err = listErr
-		delete(r.inflight, key)
-		close(rf.done)
-		r.mu.Unlock()
-		return groupResolution{}, fmt.Errorf("nacos resolver: %q: %w", service, listErr)
 	}
 
 	// Timestamp the attempt when it completes, not when it started: a slow
@@ -569,6 +626,19 @@ func (r *Resolver) resolveInGroup(ctx context.Context, service, group string, fa
 	close(rf.done)
 	base, fromMetadata, err := r.serveLocked(key, service, e, completed, fallback)
 	r.mu.Unlock()
+
+	if listErr != nil {
+		// A failed refresh is always reported, even when stale data masked it:
+		// otherwise a Nacos outage disappears behind StaleTTL.
+		// 失败的刷新一律上报，即使被陈旧数据掩盖：否则 Nacos 故障会消失在 StaleTTL
+		// 后面。
+		r.fireRefreshFailure(RefreshFailureEvent{
+			Service: service, Group: group, Err: listErr, StaleServed: err == nil,
+		})
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return groupResolution{}, fmt.Errorf("nacos resolver: %q: %w", service, ctxErr)
+	}
 	return groupResolution{base: base, refreshed: true, empty: groupEmpty(e, err), fromMetadata: fromMetadata}, err
 }
 
@@ -653,28 +723,40 @@ func (r *Resolver) filter(instances []nacosconfig.Instance) []nacosconfig.Instan
 
 // chooseLocked picks one instance. The cursor key includes the group so a
 // fallback lookup does not advance the local group's round-robin position.
+// Drained instances (weight <= 0) are skipped before the strategy runs, so a
+// drain means the same thing under random, round_robin and weight alike.
 // chooseLocked 选一个实例。游标键包含分组，因此兜底查询不会推进本地分组的轮询位置。
+// 被摘流的实例（weight <= 0）在进入策略之前就被剔除，random、round_robin 与 weight
+// 因此对"摘流"有一致的理解。
 func (r *Resolver) chooseLocked(key string, instances []nacosconfig.Instance) (nacosconfig.Instance, error) {
+	eligible := make([]nacosconfig.Instance, 0, len(instances))
+	for _, inst := range instances {
+		if inst.Weight > 0 {
+			eligible = append(eligible, inst)
+		}
+	}
+	if len(eligible) == 0 {
+		return nacosconfig.Instance{}, ErrAllZeroWeight
+	}
 	switch r.cfg.LoadBalancer {
 	case "round_robin":
-		index := r.rr[key] % uint64(len(instances))
+		index := r.rr[key] % uint64(len(eligible))
 		r.rr[key]++
-		return instances[index], nil
+		return eligible[index], nil
 	case "weight":
-		return weightedPick(instances)
+		return weightedPick(eligible)
 	default:
-		return instances[rand.IntN(len(instances))], nil
+		return eligible[rand.IntN(len(eligible))], nil
 	}
 }
 
-// weightedPick picks by weight, skipping instances whose weight is <= 0. Zero is
-// not "unset": Nacos reports the default as 1.0, so a zero means an operator
-// drained the instance. Only the weight strategy honours this; random and
-// round_robin still include drained instances, which is why draining is a
-// weight-strategy operation.
-// weightedPick 按权重抽取，跳过权重 <= 0 的实例。0 不是"没设置"：Nacos 会把默认值报成
-// 1.0，所以 0 意味着运维把这个实例摘流了。只有 weight 策略遵守这一点；random 与
-// round_robin 仍会选中被摘流的实例，因此摘流是 weight 策略下的操作。
+// weightedPick picks by weight among instances that already passed the drain
+// filter. Zero is not "unset": Nacos reports the default as 1.0, so a zero
+// means an operator drained the instance. The guard stays here because
+// weightedPick is also the last line of defence if it is ever called directly.
+// weightedPick 在已经通过摘流过滤的实例中按权重抽取。0 不是"没设置"：Nacos 会把
+// 默认值报成 1.0，所以 0 意味着运维把这个实例摘流了。守卫仍留在这里，因为
+// weightedPick 被直接调用时它就是最后一道防线。
 func weightedPick(instances []nacosconfig.Instance) (nacosconfig.Instance, error) {
 	total := 0.0
 	for _, inst := range instances {

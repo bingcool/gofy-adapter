@@ -43,7 +43,27 @@ type Config struct {
 	// Identity 写入 holderIdentity。它必须每个进程唯一，否则两个 Pod 都会认为
 	// 自己持有同一个租约；Pod 名是最自然的选择。
 	Identity string
+	// RequestTimeout bounds each API interaction (Acquire, Renew, Release).
+	// Zero means defaultRequestTimeout; a caller context without a deadline is
+	// the normal case, so without this a black-holed API server would park the
+	// lease operations forever. Negative values are rejected.
+	// RequestTimeout 限制每次 API 交互（Acquire、Renew、Release）的时长。零值表示
+	// defaultRequestTimeout。调用方的 ctx 通常没有 deadline，若没有这个限制，被黑洞
+	// 的 API server 会让租约操作永久挂起。负值被拒绝。
+	RequestTimeout time.Duration
 }
+
+// defaultRequestTimeout bounds one API interaction when Config.RequestTimeout
+// is zero.
+// defaultRequestTimeout 在 Config.RequestTimeout 为零时限制单次 API 交互的时长。
+const defaultRequestTimeout = 10 * time.Second
+
+// maxLeaseSeconds is the largest value LeaseDurationSeconds can hold. A longer
+// TTL would overflow int32 in durationSeconds and silently become one second,
+// turning a long lease into one that expires before its holder renews.
+// maxLeaseSeconds 是 LeaseDurationSeconds 能容纳的最大值。更长的 TTL 会在
+// durationSeconds 里溢出 int32，悄悄变成一秒，长租约因此在持有者续期之前就过期。
+const maxLeaseSeconds = int64(math.MaxInt32)
 
 // LeaseAPI is the subset of the coordination API this package uses. The typed
 // client satisfies it, and tests can supply a fake.
@@ -61,6 +81,13 @@ type LeaseAPI interface {
 // "a:b" 与 "a-b" 会被悄悄映射成同一个对象。
 var ErrInvalidObjectName = errors.New("k8slease: key must be a DNS-1123 subdomain")
 
+// ErrClosed means Close was called; the Locker accepts no new acquisitions.
+// Handles acquired before Close still use the API, but their Release only
+// empties the reservation table Close already cleared.
+// ErrClosed 表示 Close 已调用，Locker 不再接受新的获取。Close 之前取得的句柄
+// 仍可访问 API，但它们 Release 时清理的占用表已被 Close 清空。
+var ErrClosed = errors.New("k8slease: locker is closed")
+
 // dnsSubdomain is the name rule for Lease objects.
 // dnsSubdomain 是 Lease 对象的命名规则。
 var dnsSubdomain = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
@@ -76,6 +103,7 @@ type Locker struct {
 	api       LeaseAPI
 	namespace string
 	identity  string
+	timeout   time.Duration
 
 	// held is the in-process single-flight set, keyed by lease key.
 	//
@@ -96,6 +124,12 @@ type Locker struct {
 	// 持有者"。占用 key 既保住了恢复语义，也让第二个调用方拿到 ErrHeld。
 	mu   sync.Mutex
 	held map[string]struct{}
+
+	// closed is guarded by mu. Close sets it once; every later Acquire fails
+	// with ErrClosed instead of refilling a map nobody will drain.
+	// closed 由 mu 保护。Close 置位后，后续 Acquire 一律返回 ErrClosed，而不是
+	// 重新填充一个没人再清理的表。
+	closed bool
 }
 
 // NewForConfig builds a locker from a rest config, using the typed coordination
@@ -108,7 +142,15 @@ func NewForConfig(cfg *rest.Config, c Config) (*Locker, error) {
 	if err := validate(c); err != nil {
 		return nil, err
 	}
-	client, err := coordclient.NewForConfig(cfg)
+	// The rest config timeout is the transport-level backstop for the same
+	// budget. Copy first so the caller's config (often shared) is not mutated.
+	// rest 配置里的超时是同一预算的传输层兜底。先 Copy，避免改到调用方（常常是
+	// 共享）的配置。
+	restCfg := rest.CopyConfig(cfg)
+	if restCfg.Timeout <= 0 {
+		restCfg.Timeout = requestTimeout(c)
+	}
+	client, err := coordclient.NewForConfig(restCfg)
 	if err != nil {
 		return nil, fmt.Errorf("k8slease: coordination client: %w", err)
 	}
@@ -116,6 +158,7 @@ func NewForConfig(cfg *rest.Config, c Config) (*Locker, error) {
 		api:       client.Leases(c.Namespace),
 		namespace: c.Namespace,
 		identity:  c.Identity,
+		timeout:   requestTimeout(c),
 		held:      make(map[string]struct{}),
 	}, nil
 }
@@ -134,6 +177,7 @@ func New(api LeaseAPI, c Config) (*Locker, error) {
 		api:       api,
 		namespace: c.Namespace,
 		identity:  c.Identity,
+		timeout:   requestTimeout(c),
 		held:      make(map[string]struct{}),
 	}, nil
 }
@@ -145,7 +189,20 @@ func validate(c Config) error {
 	if c.Identity == "" {
 		return fmt.Errorf("k8slease: identity is required")
 	}
+	if c.RequestTimeout < 0 {
+		return fmt.Errorf("k8slease: request timeout must not be negative: %s", c.RequestTimeout)
+	}
 	return nil
+}
+
+// requestTimeout resolves the zero value to the default; validate has already
+// rejected negative values.
+// requestTimeout 把零值解析为默认值；负值已在 validate 中拒绝。
+func requestTimeout(c Config) time.Duration {
+	if c.RequestTimeout == 0 {
+		return defaultRequestTimeout
+	}
+	return c.RequestTimeout
 }
 
 // Acquire takes the Lease object when it is free or its term has expired.
@@ -166,6 +223,9 @@ func (l *Locker) Acquire(ctx context.Context, key string, ttl time.Duration) (le
 	if err := lease.ValidateTTL(ttl); err != nil {
 		return nil, err
 	}
+	if ttl > time.Duration(maxLeaseSeconds)*time.Second {
+		return nil, fmt.Errorf("%w: %s exceeds the %d-second LeaseDurationSeconds limit", lease.ErrInvalidTTL, ttl, maxLeaseSeconds)
+	}
 	name, err := objectName(key)
 	if err != nil {
 		return nil, err
@@ -174,9 +234,15 @@ func (l *Locker) Acquire(ctx context.Context, key string, ttl time.Duration) (le
 	// before a second caller can observe the same holderIdentity and join it.
 	// 先占用再访问 API：单飞决定必须发生在第二个调用方观察到同一个
 	// holderIdentity 并"加入"之前。
-	if !l.reserve(key) {
-		return nil, fmt.Errorf("%w: %s is already held by this process", lease.ErrHeld, key)
+	if err := l.reserve(key); err != nil {
+		return nil, err
 	}
+	// One budget covers the whole read-then-write interaction, so a slow API
+	// server cannot stretch an Acquire past its caller's patience.
+	// 一笔预算覆盖整个"先读后写"交互，慢速 API server 无法把 Acquire 拖过调用方的
+	// 忍耐极限。
+	ctx, cancel := context.WithTimeout(ctx, l.timeout)
+	defer cancel()
 	held, err := l.acquireReserved(ctx, key, name, ttl)
 	if err != nil {
 		l.unreserve(key)
@@ -185,17 +251,21 @@ func (l *Locker) Acquire(ctx context.Context, key string, ttl time.Duration) (le
 	return held, nil
 }
 
-// reserve marks key as held by this process. It reports false when the key is
-// already held, which is the case ErrHeld covers.
-// reserve 把 key 标记为本进程持有。已被持有时返回 false，也就是 ErrHeld 覆盖的场景。
-func (l *Locker) reserve(key string) bool {
+// reserve marks key as held by this process. It returns ErrHeld when the key is
+// already held, and ErrClosed once the locker was closed.
+// reserve 把 key 标记为本进程持有。key 已被持有时返回 ErrHeld，Locker 已关闭时
+// 返回 ErrClosed。
+func (l *Locker) reserve(key string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return ErrClosed
+	}
 	if _, ok := l.held[key]; ok {
-		return false
+		return fmt.Errorf("%w: %s is already held by this process", lease.ErrHeld, key)
 	}
 	l.held[key] = struct{}{}
-	return true
+	return nil
 }
 
 // unreserve releases the in-process reservation. It is called on every path
@@ -207,6 +277,26 @@ func (l *Locker) unreserve(key string) {
 	l.mu.Lock()
 	delete(l.held, key)
 	l.mu.Unlock()
+}
+
+// Close clears the in-process reservations and rejects further acquisitions.
+//
+// It does not write the Lease objects: doing so would race with handles that
+// are still in use. A caller that wants to hand a lease back must Release its
+// handle before Close; a handle dropped without Release keeps its Lease until
+// the term expires, and Close only stops the stale reservation from blocking
+// this Locker forever.
+// Close 清空进程内占用并拒绝后续获取。
+//
+// 它不写 Lease 对象：那样会与仍在使用的句柄竞争。想把租约交还的调用方必须在
+// Close 之前 Release 自己的句柄；被丢弃且未 Release 的句柄会让 Lease 一直存在到
+// 租期结束，Close 只是让残留占用不再永久阻塞本 Locker。
+func (l *Locker) Close() error {
+	l.mu.Lock()
+	l.closed = true
+	l.held = make(map[string]struct{})
+	l.mu.Unlock()
+	return nil
 }
 
 // acquireReserved performs the API interaction for a key this process already
@@ -236,7 +326,7 @@ func (l *Locker) create(ctx context.Context, key, name string, ttl time.Duration
 			LeaseTransitions:     int32Ptr(1),
 		},
 	}
-	created, err := l.api.Create(ctx, obj, metav1.CreateOptions{})
+	_, err := l.api.Create(ctx, obj, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
 		// Another instance created it between our read and write.
 		// 读与写之间被别人创建了。
@@ -245,7 +335,7 @@ func (l *Locker) create(ctx context.Context, key, name string, ttl time.Duration
 	if err != nil {
 		return nil, fmt.Errorf("k8slease: create %q: %w", name, err)
 	}
-	return &heldLease{locker: l, key: key, name: name, token: 1, ttl: ttl, version: created.ResourceVersion}, nil
+	return &heldLease{locker: l, key: key, name: name, token: 1, ttl: ttl}, nil
 }
 
 func (l *Locker) takeOrJoin(ctx context.Context, key string, ttl time.Duration, now metav1.MicroTime, cur *coordinationv1.Lease) (lease.Lease, error) {
@@ -279,7 +369,7 @@ func (l *Locker) update(ctx context.Context, key string, cur *coordinationv1.Lea
 	t := int32(token)
 	next.Spec.LeaseTransitions = &t
 
-	updated, err := l.api.Update(ctx, next, metav1.UpdateOptions{})
+	_, err := l.api.Update(ctx, next, metav1.UpdateOptions{})
 	if apierrors.IsConflict(err) {
 		// The resourceVersion moved between read and write, so somebody else
 		// won the race. Reporting ErrHeld keeps the caller polling.
@@ -290,18 +380,27 @@ func (l *Locker) update(ctx context.Context, key string, cur *coordinationv1.Lea
 	if err != nil {
 		return nil, fmt.Errorf("k8slease: update %q: %w", next.Name, err)
 	}
-	return &heldLease{locker: l, key: key, name: next.Name, token: token, ttl: ttl, version: updated.ResourceVersion}, nil
+	return &heldLease{locker: l, key: key, name: next.Name, token: token, ttl: ttl}, nil
 }
 
 // heldLease is one successful acquisition.
+//
+// Renew and Release serialize on mu. Without it two concurrent Renews would
+// read the same resourceVersion and the second Update would fail as a conflict,
+// which Renew would then report as ErrLeaseLost: self-inflicted competition
+// that drops a lease the process still holds.
 // heldLease 表示一次成功的获取。
+//
+// Renew 与 Release 通过 mu 串行化。没有它，两个并发 Renew 会读到同一个
+// resourceVersion，后一个 Update 以冲突失败，Renew 再把它报成 ErrLeaseLost：
+// 自己与自己竞争，丢掉了进程其实还持有的租约。
 type heldLease struct {
-	locker  *Locker
-	key     string
-	name    string
-	token   int64
-	ttl     time.Duration
-	version string
+	mu     sync.Mutex
+	locker *Locker
+	key    string
+	name   string
+	token  int64
+	ttl    time.Duration
 }
 
 func (h *heldLease) Key() string  { return h.key }
@@ -313,6 +412,15 @@ func (h *heldLease) String() string { return fmt.Sprintf("%s#%d", h.key, h.token
 // or another token.
 // Renew 推进 renewTime；对象上的持有者或 token 变了就拒绝。
 func (h *heldLease) Renew(ctx context.Context) error {
+	// Serialize the read-then-write so two renewals of one handle cannot read
+	// the same resourceVersion and turn the second into a false ErrLeaseLost.
+	// 串行化"先读后写"，同一句柄的两次续期不会读到同一个 resourceVersion，
+	// 第二次也就不会变成误报的 ErrLeaseLost。
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, h.locker.timeout)
+	defer cancel()
 	cur, err := h.locker.api.Get(ctx, h.name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		h.locker.unreserve(h.key)
@@ -334,7 +442,7 @@ func (h *heldLease) Renew(ctx context.Context) error {
 	next := cur.DeepCopy()
 	next.Spec.RenewTime = &now
 	next.Spec.LeaseDurationSeconds = &seconds
-	updated, err := h.locker.api.Update(ctx, next, metav1.UpdateOptions{})
+	_, err = h.locker.api.Update(ctx, next, metav1.UpdateOptions{})
 	if apierrors.IsConflict(err) {
 		// A conflict means this renew lost the race. We can no longer prove we
 		// hold the lease, so drop the in-process reservation just like the
@@ -348,7 +456,6 @@ func (h *heldLease) Renew(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("k8slease: renew %q: %w", h.name, err)
 	}
-	h.version = updated.ResourceVersion
 	return nil
 }
 
@@ -362,6 +469,15 @@ func (h *heldLease) Release(ctx context.Context) error {
 	// 无论对象是否已被接管，Release 都结束占用：两种情况下本进程都不再拥有该 key。
 	defer h.locker.unreserve(h.key)
 
+	// Share the serialization with Renew: a release racing a renewal would
+	// otherwise send an Update built from the same resourceVersion.
+	// 与 Renew 共用同一把锁：否则与续期并发的释放会用同一个 resourceVersion
+	// 构造 Update。
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, h.locker.timeout)
+	defer cancel()
 	cur, err := h.locker.api.Get(ctx, h.name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil

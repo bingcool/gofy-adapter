@@ -6,6 +6,8 @@
 
 - `adapter/gofy/`：把 `endpoint.Descriptor` 绑定到 `support.Router`，提供
   `BindGroup` / `BindAll` / `BindOptions` / `Error` / `DocsModule`；
+  `DocsModule` 仅在 `docsui.Config.Enabled` 为 true 时挂载路由，零值配置不会
+  发布文档。
 - `adapter/lease/k8slease/`：用 Kubernetes `coordination.k8s.io/v1` 的 Lease 对象
   实现 `gofy/support/lease.Locker`，见下节；
 - `client/nacos/`：基于 `gofy/support/nacos` 的服务发现 Resolver，接入
@@ -50,6 +52,21 @@ if errors.Is(err, lease.ErrHeld) {
 }
 defer held.Release(ctx)
 ```
+
+**内置超时与 TTL 上限**：`Config.RequestTimeout` 限制每次 API 交互（`Acquire`、
+`Renew`、`Release`）的时长，零值取默认 10 秒，负值在构造时被拒绝。调用方的 `ctx`
+通常没有 deadline，没有这条预算时，被黑洞的 API server 会让租约操作永久挂起；
+`NewForConfig` 同时把它写进 `rest.Config.Timeout`（`rest.CopyConfig` 复制后再改，
+不改动调用方配置），形成传输层兜底，调用方显式设置的 `rest.Config.Timeout` 优先。
+TTL 上限是 `LeaseDurationSeconds` 的 int32 范围（约 68 年）：更长的值会在换算
+秒数时溢出并悄悄退化成 1 秒，因此 `Acquire` 在入口用 `lease.ErrInvalidTTL` 拒绝。
+
+**Release 与 Close**：`Locker` 按 key 保留进程内占用（防止同一进程的两个 goroutine
+同时"恢复"同一租约），因此调用方必须 `Release` 自己取得的每个句柄；丢弃句柄会让该
+key 在本进程内一直返回 `ErrHeld`。`Locker.Close()` 清空占用表并拒绝后续 `Acquire`
+（返回 `k8slease.ErrClosed`）；Close 之前取得的句柄仍可 `Release`，用于给停机流程
+兜底。同一句柄上的 `Renew` 与 `Release` 由互斥锁串行化，并发续期不会因
+resourceVersion 冲突误报 `ErrLeaseLost`。
 
 **只编译一个 API 组**：`NewForConfig` 用 `kubernetes/typed/coordination/v1` 的类型化
 客户端，而不是完整 `Clientset`，因此 `go.sum` 里不会出现所有内置 API 类型。

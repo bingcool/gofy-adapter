@@ -143,6 +143,13 @@ func TestRateLimitHookReceivesRouterResponder(t *testing.T) {
 	}
 }
 
+// TestBindGroupResolvesNamesInDeclarationOrder also covers the whole auth
+// mechanism: the contract has no auth field, so installing "auth" through
+// Group.Use is what makes these routes authenticated, and the assertion below
+// is the proof that it actually runs.
+// TestBindGroupResolvesNamesInDeclarationOrder 同时覆盖了认证机制的全部：契约没有
+// 认证字段，因此通过 Group.Use 装上 "auth" 就是这些路由需要认证的全部依据，下面的
+// 断言就是它确实执行了的证明。
 func TestBindGroupResolvesNamesInDeclarationOrder(t *testing.T) {
 	engine, r := newFixtureRouter()
 	var order []string
@@ -186,43 +193,5 @@ func TestBindGroupRejectsInconsistentStampedPrefix(t *testing.T) {
 	err := gofyadapter.BindGroup(r, group, fixtureImpl{}, gofyadapter.BindOptions{})
 	if err == nil || !strings.Contains(err.Error(), "inconsistent route prefixes") {
 		t.Fatalf("BindGroup error = %v, want inconsistent route prefixes", err)
-	}
-}
-
-func TestAuthValidatorSeesGroupMiddlewareNames(t *testing.T) {
-	_, r := newFixtureRouter()
-	var seen [][]string
-	opts := gofyadapter.BindOptions{
-		Middleware: map[string]support.Middleware{
-			"audit": func(c *gin.Context) { c.Next() },
-			"auth":  func(c *gin.Context) { c.Next() },
-		},
-		AuthValidator: func(spec endpoint.Spec, declared []string) error {
-			if spec.Auth == endpoint.AuthRequired {
-				seen = append(seen, append([]string(nil), declared...))
-			}
-			return nil
-		},
-	}
-	if err := gofyadapter.BindGroup(r, testcontract.Items, fixtureImpl{}, opts); err != nil {
-		t.Fatalf("BindGroup: %v", err)
-	}
-	if len(seen) == 0 {
-		t.Fatal("AuthValidator was never called for the AuthRequired route")
-	}
-	joined := strings.Join(seen[0], ",")
-	if !strings.Contains(joined, "auth") || !strings.Contains(joined, "audit") {
-		t.Fatalf("declared names = %v, want group names audit/auth", seen[0])
-	}
-}
-
-func TestAuthRequiredAddsNoImplicitMiddleware(t *testing.T) {
-	_, r := newFixtureRouter()
-	// GetItem declares AuthRequired but no auth middleware name; the adapter must
-	// not invent one, and the default (nil) validator keeps startup unchanged.
-	// GetItem 声明 AuthRequired 但没有 auth 中间件名；adapter 不得擅自补一个，
-	// 默认 nil validator 也保持启动行为不变。
-	if err := gofyadapter.BindAll(r, []endpoint.Descriptor{testcontract.GetItem}, fixtureImpl{}, gofyadapter.BindOptions{}); err != nil {
-		t.Fatalf("BindAll: %v", err)
 	}
 }

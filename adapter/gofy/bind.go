@@ -94,12 +94,6 @@ func BindGroup(
 	if err != nil {
 		return err
 	}
-	// The group name is also handed to AuthValidator: auth is usually declared
-	// at the group level, and route names alone would make Required routes look
-	// like no auth middleware is installed.
-	// 分组名要传给 AuthValidator：认证通常声明在分组层，只给路由名会让
-	// Required 路由被误判为“没有安装认证”。
-	opts.groupMiddleware = group.Middleware
 	return BindAll(r.Group(group.Prefix, mw...), group.Routes, impl, opts)
 }
 
@@ -240,15 +234,6 @@ func BindAll(
 			add("%s: %v", name, err)
 			continue
 		}
-		// Validate auth declarations only after the middleware names of the route
-		// have resolved: the callback then sees exactly the group and route names
-		// that get installed, so a mismatch fails at startup.
-		// 中间件名解析完成后再校验认证声明：回调看到的分组名与路由名就是
-		// 实际会被安装的那一组，声明与实现不一致时启动直接失败。
-		if err := validateAuth(spec, opts); err != nil {
-			add("%s: %v", name, err)
-			continue
-		}
 		r.Handle(spec.Method, ginPath(bindPath(r, spec.Path)), dynamicHandler(r, responder, method, desc, spec), mw...)
 	}
 
@@ -270,10 +255,11 @@ func BindAll(
 // when the limiter counts per user. Routes without Spec.RateLimit get no
 // limiter.
 //
-// Every middleware other than auth comes from explicit declarations: Spec.Auth
-// only drives OpenAPI marking, and the adapter never attaches auth middleware
-// based on AuthRequired; routes that need auth must declare group.Use("auth")
-// or spec.Middleware = []string{"auth"} in the contract.
+// Every middleware comes from an explicit declaration, auth included: the
+// contract has no auth field, so "this route requires authentication" is
+// expressed by installing the auth middleware (group.Use("auth") or
+// spec.Middleware = []string{"auth"}). A route without it is public, and the
+// adapter attaches nothing implicitly.
 // routeMiddleware 组装单条路由的中间件链，顺序为：
 // RateLimit（契约声明时）→ BindOptions.Global → Spec.Middleware（逻辑名解析）
 // → Routes[OperationID]。
@@ -283,9 +269,9 @@ func BindAll(
 // 在分组层（group.Use("auth")），所以按用户计数时身份已经就绪。
 // 契约没有声明 Spec.RateLimit 的路由不挂限流。
 //
-// 认证以外的中间件全部来自显式声明：Spec.Auth 只用于 OpenAPI 标记，
-// adapter 不会再按 AuthRequired 自动附加任何认证中间件；需要认证的路由在
-// 契约里用 group.Use("auth") 或 spec.Middleware = []string{"auth"} 声明。
+// 包括认证在内的所有中间件都来自显式声明：契约没有认证字段，"这条路由需要
+// 认证"就是装上认证中间件（group.Use("auth") 或 spec.Middleware =
+// []string{"auth"}）。没有装的路由就是公开的，adapter 不会隐式附加任何东西。
 func routeMiddleware(r *support.Router, spec endpoint.Spec, opts BindOptions) ([]support.Middleware, error) {
 	var mw []support.Middleware
 	if spec.RateLimit != nil && opts.RateLimit != nil {
@@ -304,34 +290,6 @@ func routeMiddleware(r *support.Router, spec endpoint.Spec, opts BindOptions) ([
 	mw = append(mw, routeNamed...)
 	mw = append(mw, opts.Routes[spec.OperationID]...)
 	return mw, nil
-}
-
-// validateAuth checks the auth declarations of non-AuthNone routes with
-// BindOptions.AuthValidator.
-//
-// The callback runs only after the route's middleware names resolve
-// successfully; AuthNone imposes no auth requirement and is skipped, so "no
-// auth" is not mistaken for "auth middleware missing". Declared names are
-// merged group-first, route-second, matching execution order;
-// BindOptions.Global / Routes are instances and cannot be reported by name to
-// the callback.
-// validateAuth 用 BindOptions.AuthValidator 校验非 AuthNone 路由的认证声明。
-//
-// 回调只在路由的中间件名字解析成功后调用；AuthNone 不产生认证要求，直接
-// 跳过，避免把“没有认证”误判成“未安装认证”。声明名按分组在前、路由在后
-// 合并，与执行顺序一致；BindOptions.Global / Routes 是实例，无法以名字形式
-// 提供给回调。
-func validateAuth(spec endpoint.Spec, opts BindOptions) error {
-	if opts.AuthValidator == nil {
-		return nil
-	}
-	if spec.Auth != endpoint.AuthRequired && spec.Auth != endpoint.AuthOptional {
-		return nil
-	}
-	declared := make([]string, 0, len(opts.groupMiddleware)+len(spec.Middleware))
-	declared = append(declared, opts.groupMiddleware...)
-	declared = append(declared, spec.Middleware...)
-	return opts.AuthValidator(spec, declared)
 }
 
 // resolveMiddlewareNames maps logical names onto concrete middleware, keeping

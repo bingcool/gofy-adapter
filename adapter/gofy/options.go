@@ -16,47 +16,6 @@ type MiddlewareRegistry interface {
 	Lookup(name string) (support.Middleware, bool)
 }
 
-// AuthValidator checks, after middleware declarations have resolved, whether
-// Spec.Auth matches the auth policy that is actually installed.
-//
-// spec is the route metadata (including OperationID and Auth);
-// declaredMiddleware holds the logical names through which this route may
-// declare auth, group names (Group.Use, before BindGroup resolves them) first
-// and route names (Spec.Middleware / Route.Use) second. BindOptions.Global and
-// BindOptions.Routes carry middleware instances rather than names, so they
-// never appear in declaredMiddleware.
-//
-// It is called only when Spec.Auth is AuthRequired or AuthOptional; AuthNone
-// (the zero value) imposes no auth requirement and is skipped, so the callback
-// is never triggered by mistake. A non-nil return makes BindGroup / BindAll
-// fail at startup (Reload follows the same path), and the error names the
-// offending route instead of surfacing at runtime.
-//
-// The adapter interprets no auth alias and bundles no auth middleware: the
-// callback applies the application's own policy, e.g. Required demands "auth"
-// while Optional demands a middleware name that admits anonymous requests; the
-// exact names are the application's convention. A nil validator skips the
-// check entirely, which matches the behaviour before this field existed.
-// AuthValidator 在中间件声明解析完成后校验 Spec.Auth 与真实安装的认证策略
-// 是否一致。
-//
-// spec 是路由元数据（含 OperationID 与 Auth）；declaredMiddleware 是这条路由
-// 可声明认证的逻辑名，顺序为分组名（Group.Use，BindGroup 解析前）在前、
-// 路由名（Spec.Middleware / Route.Use）在后。BindOptions.Global 与
-// BindOptions.Routes 直接传入的是中间件实例而不是名字，因此不会出现在
-// declaredMiddleware 里。
-//
-// 只有 Spec.Auth 为 AuthRequired 或 AuthOptional 时才会调用；AuthNone
-// （零值）不产生认证要求，adapter 直接跳过，回调不会被误触发。回调返回
-// 非 nil 会让 BindGroup / BindAll 启动失败（Reload 也走同一路径），错误会
-// 带上具体路由，而不是留到运行期才发现。
-//
-// adapter 不解释任何认证别名，也不内置认证中间件：回调按应用自己的策略判断，
-// 例如 Required 要求存在 "auth"、Optional 要求存在一个支持匿名放行的
-// 中间件名，具体名字由应用约定。为 nil 时跳过校验，行为与引入该字段之前
-// 完全一致。
-type AuthValidator func(spec endpoint.Spec, declaredMiddleware []string) error
-
 // BindOptions configures BindAll middleware and validation.
 //
 // 所有中间件都必须显式给出：要么是服务端直接传入的实例
@@ -118,23 +77,6 @@ type BindOptions struct {
 	// 第二个参数是 Router 的 Responder，限流拒绝因此与 App 的 handler 使用同一个
 	// 错误信封；没有它时 429/503 会由库内默认 Responder 渲染，与其余接口不一致。
 	RateLimit func(endpoint.Spec, support.Responder) support.Middleware
-
-	// AuthValidator checks, after the middleware names of the route have
-	// resolved, whether the auth declaration matches the installed auth policy;
-	// see the AuthValidator type. nil means no check (the default), so the
-	// startup behaviour of existing projects is unchanged; production
-	// deployments should configure strict validation explicitly.
-	// AuthValidator 在路由的中间件名字解析完成后校验认证声明是否与真实
-	// 安装的认证策略一致，见 AuthValidator 类型说明。nil 表示不校验（默认），
-	// 现有项目的启动行为不变；生产环境建议显式配置严格校验。
-	AuthValidator AuthValidator
-
-	// groupMiddleware holds the group middleware logical names passed in by
-	// BindGroup; it is read only by AuthValidator, takes no part in resolution
-	// and is not exposed.
-	// groupMiddleware 是 BindGroup 传入的分组中间件逻辑名，仅供
-	// AuthValidator 读取；它不参与解析，也不对外暴露。
-	groupMiddleware []string
 
 	// Strict is reserved. Signature mismatches are always reported.
 	// Strict 为保留字段；签名不匹配始终会被上报。

@@ -94,7 +94,6 @@ var (
 		Path:        "/api/test/items/{id}",
 		Summary:     "get one item",
 		Tags:        []string{ServiceName},
-		Auth:        endpoint.AuthRequired,
 		Errors: []endpoint.ErrorSpec{
 			{Code: ErrCodeNotFound, Status: http.StatusNotFound, Message: "item not found"},
 		},
@@ -146,7 +145,6 @@ var (
 		Path:        "/api/test/config",
 		Summary:     "read config",
 		Tags:        []string{ServiceName},
-		Auth:        endpoint.AuthOptional,
 	})
 
 	// Items declares group middleware names and keeps route declaration order.

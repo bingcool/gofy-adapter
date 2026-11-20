@@ -52,7 +52,7 @@ func Bind[Req, Res any](
 	r *support.Router,
 	rt *endpoint.Route[Req, Res],
 	h support.Handler[Req, Res],
-	mw ...support.Middleware,
+	mw ...support.MiddlewareFunc,
 ) {
 	spec := rt.Spec()
 	path := ginPath(bindPath(r, spec.Path))
@@ -137,7 +137,7 @@ func normalizeGroupPrefix(prefix string) string {
 // concrete middleware, preserving their order.
 //
 // resolveGroupMiddleware 把分组声明的逻辑名映射成具体中间件，顺序保持不变。
-func resolveGroupMiddleware(r *support.Router, group *endpoint.Group, opts BindOptions) ([]support.Middleware, error) {
+func resolveGroupMiddleware(r *support.Router, group *endpoint.Group, opts BindOptions) ([]support.MiddlewareFunc, error) {
 	resolved, err := resolveMiddlewareNames(r, group.Middleware, opts)
 	if err != nil {
 		return nil, fmt.Errorf("group %q: %w", group.Prefix, err)
@@ -272,8 +272,8 @@ func BindAll(
 // 包括认证在内的所有中间件都来自显式声明：契约没有认证字段，"这条路由需要
 // 认证"就是装上认证中间件（group.Use("auth") 或 spec.Middleware =
 // []string{"auth"}）。没有装的路由就是公开的，adapter 不会隐式附加任何东西。
-func routeMiddleware(r *support.Router, spec endpoint.Spec, opts BindOptions) ([]support.Middleware, error) {
-	var mw []support.Middleware
+func routeMiddleware(r *support.Router, spec endpoint.Spec, opts BindOptions) ([]support.MiddlewareFunc, error) {
+	var mw []support.MiddlewareFunc
 	if spec.RateLimit != nil && opts.RateLimit != nil {
 		// The limiter rejects with the Router's responder, so its 429/503 carry
 		// the same envelope as every other route error.
@@ -300,11 +300,11 @@ func routeMiddleware(r *support.Router, spec endpoint.Spec, opts BindOptions) ([
 // 名字在 Middleware 映射、Registry 注册表和 Router 的 App 注册表里都找不到
 // 时返回错误，由 BindGroup / BindAll 在启动期上报，不会让路由带着缺失的
 // 中间件上线。
-func resolveMiddlewareNames(r *support.Router, names []string, opts BindOptions) ([]support.Middleware, error) {
+func resolveMiddlewareNames(r *support.Router, names []string, opts BindOptions) ([]support.MiddlewareFunc, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
-	resolved := make([]support.Middleware, 0, len(names))
+	resolved := make([]support.MiddlewareFunc, 0, len(names))
 	for _, name := range names {
 		mw, ok := lookupMiddleware(r, name, opts)
 		if !ok {
@@ -321,7 +321,7 @@ func resolveMiddlewareNames(r *support.Router, names []string, opts BindOptions)
 // registry.
 // lookupMiddleware 先查本次绑定的显式映射，再查注入的注册表，最后查 Router
 // 携带的 App 级注册表；因此单次绑定可以覆盖注册表里的同名中间件。
-func lookupMiddleware(r *support.Router, name string, opts BindOptions) (support.Middleware, bool) {
+func lookupMiddleware(r *support.Router, name string, opts BindOptions) (support.MiddlewareFunc, bool) {
 	if mw, ok := opts.Middleware[name]; ok && mw != nil {
 		return mw, true
 	}

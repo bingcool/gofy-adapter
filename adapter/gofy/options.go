@@ -13,7 +13,7 @@ import (
 // support/middleware.Registry 实现。这里只声明需要的方法，adapter 因此不依赖
 // 具体注册表类型，测试也可以注入自己的实现。
 type MiddlewareRegistry interface {
-	Lookup(name string) (support.Middleware, bool)
+	Lookup(name string) (support.MiddlewareFunc, bool)
 }
 
 // BindOptions configures BindAll middleware and validation.
@@ -29,11 +29,11 @@ type MiddlewareRegistry interface {
 type BindOptions struct {
 	// Global applies to every contract route.
 	// Global 作用于每一条契约路由。
-	Global []support.Middleware
+	Global []support.MiddlewareFunc
 
 	// Routes adds middleware per OperationID.
 	// Routes 按 OperationID 追加路由级中间件。
-	Routes map[string][]support.Middleware
+	Routes map[string][]support.MiddlewareFunc
 
 	// Middleware is the explicit alias map of this binding and has the highest
 	// priority, so it can override same-named middleware in a registry (e.g. a
@@ -45,7 +45,7 @@ type BindOptions struct {
 	// 同名中间件（例如测试桩或某个模块的定制实现）。分组名来自
 	// endpoint.Group.Use（由 BindGroup 解析），路由名来自 Spec.Middleware /
 	// Route.Use（由 BindAll 解析）。名字缺失或值为 nil 时在启动期报错。
-	Middleware map[string]support.Middleware
+	Middleware map[string]support.MiddlewareFunc
 
 	// Registry is an optional server-side registry. When nil, only the
 	// Middleware map and the App-level registry carried by the Router are used.
@@ -76,7 +76,7 @@ type BindOptions struct {
 	//
 	// 第二个参数是 Router 的 Responder，限流拒绝因此与 App 的 handler 使用同一个
 	// 错误信封；没有它时 429/503 会由库内默认 Responder 渲染，与其余接口不一致。
-	RateLimit func(endpoint.Spec, support.Responder) support.Middleware
+	RateLimit func(endpoint.Spec, support.Responder) support.MiddlewareFunc
 
 	// Strict is reserved. Signature mismatches are always reported.
 	// Strict 为保留字段；签名不匹配始终会被上报。

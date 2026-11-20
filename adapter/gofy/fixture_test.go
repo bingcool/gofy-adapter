@@ -127,7 +127,7 @@ func TestRateLimitHookReceivesRouterResponder(t *testing.T) {
 	want := r.Responder()
 	var got support.Responder
 	err := gofyadapter.BindAll(r, testcontract.Routes(), fixtureImpl{}, gofyadapter.BindOptions{
-		RateLimit: func(_ endpoint.Spec, responder support.Responder) support.Middleware {
+		RateLimit: func(_ endpoint.Spec, responder support.Responder) support.MiddlewareFunc {
 			got = responder
 			return nil
 		},
@@ -153,13 +153,13 @@ func TestRateLimitHookReceivesRouterResponder(t *testing.T) {
 func TestBindGroupResolvesNamesInDeclarationOrder(t *testing.T) {
 	engine, r := newFixtureRouter()
 	var order []string
-	mw := func(name string) support.Middleware {
+	mw := func(name string) support.MiddlewareFunc {
 		return func(c *gin.Context) {
 			order = append(order, name)
 			c.Next()
 		}
 	}
-	opts := gofyadapter.BindOptions{Middleware: map[string]support.Middleware{
+	opts := gofyadapter.BindOptions{Middleware: map[string]support.MiddlewareFunc{
 		"audit": mw("audit"),
 		"auth":  mw("auth"),
 	}}

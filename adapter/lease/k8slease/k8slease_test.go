@@ -602,3 +602,168 @@ func TestCloseFreesReservationsAndRejectsAcquire(t *testing.T) {
 		t.Fatalf("holder = %q after Release, want empty", got)
 	}
 }
+
+// renewGateAPI parks the first Get after block is set, signalling when it is
+// inside. That makes an API call observably in flight while Close runs.
+// ignoreCtx keeps the call parked even after the request deadline, which
+// exercises Close's own wait bound.
+// renewGateAPI 在 block 置位后让第一次 Get 停住，并在进入时发信号，测试因此能
+// 观察一次确实在途的 API 调用。ignoreCtx 让调用连请求超时也不解除阻塞，用它
+// 检验 Close 自身的等待上限。
+type renewGateAPI struct {
+	*fakeAPI
+	blocked   atomic.Bool
+	ignoreCtx atomic.Bool
+	entered   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func newRenewGateAPI() *renewGateAPI {
+	return &renewGateAPI{
+		fakeAPI: newFakeAPI(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (g *renewGateAPI) Get(ctx context.Context, name string, opts metav1.GetOptions) (*coordinationv1.Lease, error) {
+	if g.blocked.Load() {
+		g.once.Do(func() { close(g.entered) })
+		if g.ignoreCtx.Load() {
+			<-g.release
+		} else {
+			select {
+			case <-g.release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
+	return g.fakeAPI.Get(ctx, name, opts)
+}
+
+// TestCloseWaitsForInFlightRenew pins P2-08: Close must not return while an
+// API call that started before it is still running.
+// TestCloseWaitsForInFlightRenew 固定 P2-08：仍在进行、早于 Close 的 API 调用
+// 结束前，Close 不能返回。
+func TestCloseWaitsForInFlightRenew(t *testing.T) {
+	api := newRenewGateAPI()
+	l, err := k8slease.New(api, k8slease.Config{Namespace: "default", Identity: "pod-a", RequestTimeout: time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	held, err := l.Acquire(context.Background(), "settle-reconcile", ttl)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	api.blocked.Store(true)
+	renewDone := make(chan error, 1)
+	go func() { renewDone <- held.Renew(context.Background()) }()
+	<-api.entered
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- l.Close() }()
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned while the Renew was still in flight")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(api.release)
+	if err := <-renewDone; err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after the in-flight Renew finished")
+	}
+}
+
+// TestCloseWaitIsBoundedByRequestTimeout pins the wait ceiling: a Close issued
+// while an operation ignores its own deadline still returns in bounded time.
+// TestCloseWaitIsBoundedByRequestTimeout 固定等待上限：在途操作无视自身 deadline
+// 时，Close 仍要在有界时间内返回。
+func TestCloseWaitIsBoundedByRequestTimeout(t *testing.T) {
+	api := newRenewGateAPI()
+	const budget = 40 * time.Millisecond
+	l, err := k8slease.New(api, k8slease.Config{Namespace: "default", Identity: "pod-a", RequestTimeout: budget})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	held, err := l.Acquire(context.Background(), "settle-reconcile", ttl)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	api.blocked.Store(true)
+	api.ignoreCtx.Store(true)
+	renewDone := make(chan error, 1)
+	go func() { renewDone <- held.Renew(context.Background()) }()
+	<-api.entered
+
+	start := time.Now()
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < budget/2 {
+		t.Fatalf("Close returned after %s, did not wait for the in-flight operation", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Close blocked for %s despite the %s budget", elapsed, budget)
+	}
+
+	close(api.release)
+	if err := <-renewDone; err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+}
+
+// TestCloseDoesNotBlockReservationCleanup covers the deadlock constraint: an
+// in-flight Renew that loses the lease needs mu to drop its reservation, so
+// Close must not hold mu while waiting for it.
+// TestCloseDoesNotBlockReservationCleanup 覆盖死锁约束：在途 Renew 丢失租约后
+// 需要 mu 清理占用，Close 等待时因此不能持有 mu。
+func TestCloseDoesNotBlockReservationCleanup(t *testing.T) {
+	api := newRenewGateAPI()
+	l, err := k8slease.New(api, k8slease.Config{Namespace: "default", Identity: "pod-a", RequestTimeout: time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	held, err := l.Acquire(context.Background(), "settle-reconcile", ttl)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	api.blocked.Store(true)
+	renewDone := make(chan error, 1)
+	go func() { renewDone <- held.Renew(context.Background()) }()
+	<-api.entered
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- l.Close() }()
+
+	// Make the parked Renew discover another holder once it resumes; its
+	// ErrLeaseLost path calls unreserve, which needs mu.
+	// 让停住的 Renew 恢复后发现持有者已变；ErrLeaseLost 分支会调用需要 mu 的
+	// unreserve。
+	api.takeover(t, "settle-reconcile", "pod-b")
+	close(api.release)
+	if err := <-renewDone; !errors.Is(err, lease.ErrLeaseLost) {
+		t.Fatalf("Renew = %v, want ErrLeaseLost", err)
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close deadlocked with the in-flight Renew's reservation cleanup")
+	}
+}

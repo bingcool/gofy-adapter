@@ -130,6 +130,15 @@ type Locker struct {
 	// closed 由 mu 保护。Close 置位后，后续 Acquire 一律返回 ErrClosed，而不是
 	// 重新填充一个没人再清理的表。
 	closed bool
+
+	// inflight counts API operations registered before Close began. Close waits
+	// on it so no API request from an operation that predates Close outlives it.
+	// Add shares mu with the closed check, so no operation can join Close's
+	// Wait; each operation pairs its Add with Done.
+	// inflight 记录 Close 开始前已登记的 API 操作数。Close 等待它，保证早于 Close
+	// 的操作发出的 API 请求不会活过 Close。Add 与 closed 检查共用 mu，因此没有
+	// 操作能在 Close 的 Wait 之后加入；每个操作的 Add 都与 Done 成对出现。
+	inflight sync.WaitGroup
 }
 
 // NewForConfig builds a locker from a rest config, using the typed coordination
@@ -237,6 +246,7 @@ func (l *Locker) Acquire(ctx context.Context, key string, ttl time.Duration) (le
 	if err := l.reserve(key); err != nil {
 		return nil, err
 	}
+	defer l.inflight.Done()
 	// One budget covers the whole read-then-write interaction, so a slow API
 	// server cannot stretch an Acquire past its caller's patience.
 	// 一笔预算覆盖整个"先读后写"交互，慢速 API server 无法把 Acquire 拖过调用方的
@@ -265,6 +275,7 @@ func (l *Locker) reserve(key string) error {
 		return fmt.Errorf("%w: %s is already held by this process", lease.ErrHeld, key)
 	}
 	l.held[key] = struct{}{}
+	l.inflight.Add(1)
 	return nil
 }
 
@@ -279,14 +290,41 @@ func (l *Locker) unreserve(key string) {
 	l.mu.Unlock()
 }
 
+// beginInflight registers a Renew or Release as an in-flight API operation.
+// It returns false once Close has begun: the operation still runs so handles
+// taken before Close keep working, but Close no longer waits for it. Checking
+// closed here keeps Add from racing with Close's Wait.
+// beginInflight 把 Renew 或 Release 登记为在途 API 操作。Close 开始后返回 false：
+// 操作照常执行，Close 前取得的句柄仍然可用，只是 Close 不再等待它。在这里检查
+// closed，避免 Add 与 Close 的 Wait 竞争。
+func (l *Locker) beginInflight() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return false
+	}
+	l.inflight.Add(1)
+	return true
+}
+
+// endInflight completes an operation registered by beginInflight.
+// endInflight 结束一次由 beginInflight 登记的操作。
+func (l *Locker) endInflight(tracked bool) {
+	if tracked {
+		l.inflight.Done()
+	}
+}
+
 // Close clears the in-process reservations and rejects further acquisitions.
+// It waits for API operations already in flight to finish, up to RequestTimeout.
 //
 // It does not write the Lease objects: doing so would race with handles that
 // are still in use. A caller that wants to hand a lease back must Release its
 // handle before Close; a handle dropped without Release keeps its Lease until
 // the term expires, and Close only stops the stale reservation from blocking
 // this Locker forever.
-// Close 清空进程内占用并拒绝后续获取。
+// Close 清空进程内占用并拒绝后续获取，并等待已经在途的 API 操作结束，
+// 最多等待 RequestTimeout。
 //
 // 它不写 Lease 对象：那样会与仍在使用的句柄竞争。想把租约交还的调用方必须在
 // Close 之前 Release 自己的句柄；被丢弃且未 Release 的句柄会让 Lease 一直存在到
@@ -296,6 +334,23 @@ func (l *Locker) Close() error {
 	l.closed = true
 	l.held = make(map[string]struct{})
 	l.mu.Unlock()
+
+	// Do not hold mu while waiting: an in-flight Renew or Release may still
+	// need it to drop its reservation. The timeout bounds the wait so a Close
+	// issued from inside an in-flight operation cannot hang on itself.
+	// 等待时不能持有 mu：在途的 Renew / Release 可能还需要它清理占用。超时给等待
+	// 设上限，从在途操作内部调用 Close 时不会把自己永久等死。
+	done := make(chan struct{})
+	go func() {
+		l.inflight.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(l.timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 	return nil
 }
 
@@ -412,6 +467,9 @@ func (h *heldLease) String() string { return fmt.Sprintf("%s#%d", h.key, h.token
 // or another token.
 // Renew 推进 renewTime；对象上的持有者或 token 变了就拒绝。
 func (h *heldLease) Renew(ctx context.Context) error {
+	tracked := h.locker.beginInflight()
+	defer h.locker.endInflight(tracked)
+
 	// Serialize the read-then-write so two renewals of one handle cannot read
 	// the same resourceVersion and turn the second into a false ErrLeaseLost.
 	// 串行化"先读后写"，同一句柄的两次续期不会读到同一个 resourceVersion，
@@ -464,6 +522,9 @@ func (h *heldLease) Renew(ctx context.Context) error {
 // Release 通过清空持有者并把租期缩到一秒来交还租约，这也是 Kubernetes 选举代码的
 // 惯例。
 func (h *heldLease) Release(ctx context.Context) error {
+	tracked := h.locker.beginInflight()
+	defer h.locker.endInflight(tracked)
+
 	// The reservation ends with Release even if the object was already taken
 	// over: this process no longer owns the key either way.
 	// 无论对象是否已被接管，Release 都结束占用：两种情况下本进程都不再拥有该 key。

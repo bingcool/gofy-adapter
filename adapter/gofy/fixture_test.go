@@ -89,6 +89,30 @@ func TestBindAllRejectsDuplicateOperationID(t *testing.T) {
 	}
 }
 
+// TestBindAllDoesNotRegisterWhenValidationFails pins P2-03: a bad descriptor
+// must not leave earlier, otherwise-valid routes registered on the router.
+// TestBindAllDoesNotRegisterWhenValidationFails 固定 P2-03：坏描述符不能让前面
+// 本应合法的路由先注册到 Router 上。
+func TestBindAllDoesNotRegisterWhenValidationFails(t *testing.T) {
+	engine, r := newFixtureRouter()
+	// GetItem is valid; the second descriptor names a method the implementation
+	// does not have, so validation fails after the first route was inspected.
+	// GetItem 合法；第二个描述符指向实现里不存在的方法，校验在检查完第一条后失败。
+	broken := endpoint.New[testcontract.ItemRequest, testcontract.ItemResponse](endpoint.Spec{
+		OperationID: "MissingMethod",
+		Method:      http.MethodGet,
+		Path:        "/api/test/missing",
+	})
+	routes := []endpoint.Descriptor{testcontract.GetItem, broken}
+	err := gofyadapter.BindAll(r, routes, fixtureImpl{}, gofyadapter.BindOptions{})
+	if err == nil || !strings.Contains(err.Error(), "implementation has no method") {
+		t.Fatalf("BindAll error = %v, want the missing-method problem", err)
+	}
+	if registered := engine.Routes(); len(registered) != 0 {
+		t.Fatalf("failed BindAll left %d route(s) registered: %v", len(registered), registered)
+	}
+}
+
 func TestBindAllAggregatesEveryProblem(t *testing.T) {
 	_, r := newFixtureRouter()
 	bad := endpoint.New[testcontract.ItemRequest, testcontract.ItemResponse](endpoint.Spec{

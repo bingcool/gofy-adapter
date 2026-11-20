@@ -145,12 +145,27 @@ func resolveGroupMiddleware(r *support.Router, group *endpoint.Group, opts BindO
 	return resolved, nil
 }
 
+// pendingBinding is one fully validated route waiting for the registration
+// phase. Keeping it off the validation loop means a bad route cannot leave
+// earlier routes registered on the router.
+// pendingBinding 是一条已完全校验、等待注册阶段的路由。把它移出校验循环，
+// 坏路由就不会让前面的路由先注册到 Router 上。
+type pendingBinding struct {
+	method  string
+	path    string
+	handler gin.HandlerFunc
+	mw      []support.MiddlewareFunc
+}
+
 // BindAll validates the route set and binds every descriptor to impl.
 // Signature and metadata problems are aggregated: the error lists every failed
 // route instead of stopping at the first one.
+// Registration is deferred until the whole set passes validation, so a failed
+// bind never leaves a partially registered router.
 // BindAll 校验路由集合并把每个描述符绑定到 impl。
 // 签名与元数据问题会聚合返回：错误里列出所有失败的路由，而不是遇到第一个
 // 就退出。
+// 只有整组路由全部通过校验后才注册，因此绑定失败不会留下只注册了一半的 Router。
 func BindAll(
 	r *support.Router,
 	routes []endpoint.Descriptor,
@@ -167,6 +182,7 @@ func BindAll(
 	add := func(format string, args ...any) {
 		problems = append(problems, fmt.Sprintf(format, args...))
 	}
+	var pending []pendingBinding
 
 	seenOp := make(map[string]bool, len(routes))
 	seenRoute := make(map[string]bool, len(routes))
@@ -234,12 +250,20 @@ func BindAll(
 			add("%s: %v", name, err)
 			continue
 		}
-		r.Handle(spec.Method, ginPath(bindPath(r, spec.Path)), dynamicHandler(r, responder, method, desc, spec), mw...)
+		pending = append(pending, pendingBinding{
+			method:  spec.Method,
+			path:    ginPath(bindPath(r, spec.Path)),
+			handler: dynamicHandler(r, responder, method, desc, spec),
+			mw:      mw,
+		})
 	}
 
 	if len(problems) > 0 {
 		sort.Strings(problems)
 		return errors.New("gofyadapter: invalid routes:\n  - " + strings.Join(problems, "\n  - "))
+	}
+	for _, binding := range pending {
+		r.Handle(binding.method, binding.path, binding.handler, binding.mw...)
 	}
 	return nil
 }

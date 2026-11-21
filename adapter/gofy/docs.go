@@ -1,6 +1,8 @@
 package gofyadapter
 
 import (
+	"errors"
+
 	"github.com/bingcool/gofy-interface-api/docsui"
 	"github.com/bingcool/gofy/support"
 	"github.com/gin-gonic/gin"
@@ -39,12 +41,22 @@ func (m *docsModule) Register(r *support.Router) error {
 		return err
 	}
 	docsPath := m.cfg.EffectiveDocsPath()
-	r.GET(docsPath, gin.WrapH(h))
-	if docsPath != "/" {
-		// Swagger UI loads its assets from DocsPath/.
-		// Swagger UI 会从 DocsPath/ 下加载静态资源。
-		r.GET(docsPath+"/*any", gin.WrapH(h))
+	// gin matches "/" exactly, not as a prefix, and a catch-all cannot be
+	// registered on the same engine as the spec route. DocsPath="/" therefore
+	// serves the HTML shell while every asset it references (/swagger-ui.css,
+	// ...) answers 404 — a page that looks broken for a reason nobody can see
+	// from the config. Refusing at registration keeps that failure at startup.
+	// gin 的 "/" 是精确匹配而不是前缀，catch-all 又无法与 spec 路由注册在同一个
+	// engine 上。因此 DocsPath="/" 只会返回 HTML 外壳，它引用的每个资源
+	// （/swagger-ui.css 等）都是 404——一个坏掉的页面，而原因在配置里看不出来。
+	// 在注册阶段拒绝，可以让这个失败发生在启动时。
+	if docsPath == "/" {
+		return errors.New(`gofy: docs DocsPath must not be "/"; use a prefix such as /docs`)
 	}
+	r.GET(docsPath, gin.WrapH(h))
+	// Swagger UI loads its assets from DocsPath/.
+	// Swagger UI 会从 DocsPath/ 下加载静态资源。
+	r.GET(docsPath+"/*any", gin.WrapH(h))
 	r.GET(m.cfg.EffectiveSpecPath(), gin.WrapH(h))
 	return nil
 }

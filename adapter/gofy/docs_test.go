@@ -32,3 +32,25 @@ func TestDocsModuleServesOnlyWhenEnabled(t *testing.T) {
 		t.Fatalf("docs status = %d, want 200", rec.Code)
 	}
 }
+
+// TestDocsModuleRejectsRootPath pins the gin limitation behind the refusal:
+// "/" is an exact match, so the UI's assets would 404, and a catch-all cannot
+// coexist with the spec route on the same engine. Failing at registration beats
+// serving a page that is broken for a reason invisible in the config.
+// TestDocsModuleRejectsRootPath 固定拒绝背后的 gin 限制："/" 是精确匹配，UI 的静态
+// 资源会 404，而 catch-all 无法与 spec 路由共存于同一个 engine。在注册阶段失败，好过
+// 提供一个坏掉却看不出原因的页面。
+func TestDocsModuleRejectsRootPath(t *testing.T) {
+	_, router := newFixtureRouter()
+	err := gofyadapter.DocsModule(docsui.Config{
+		Enabled:  true,
+		Spec:     docsSpec,
+		DocsPath: "/",
+	}).Register(router)
+	if err == nil {
+		t.Fatal(`Register accepted DocsPath="/", which serves the UI without its assets`)
+	}
+	if !strings.Contains(err.Error(), "DocsPath") {
+		t.Fatalf("error does not name the setting: %v", err)
+	}
+}

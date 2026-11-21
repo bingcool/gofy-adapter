@@ -43,13 +43,15 @@ type Config struct {
 	// Identity 写入 holderIdentity。它必须每个进程唯一，否则两个 Pod 都会认为
 	// 自己持有同一个租约；Pod 名是最自然的选择。
 	Identity string
-	// RequestTimeout bounds each API interaction (Acquire, Renew, Release).
-	// Zero means defaultRequestTimeout; a caller context without a deadline is
-	// the normal case, so without this a black-holed API server would park the
-	// lease operations forever. Negative values are rejected.
-	// RequestTimeout 限制每次 API 交互（Acquire、Renew、Release）的时长。零值表示
-	// defaultRequestTimeout。调用方的 ctx 通常没有 deadline，若没有这个限制，被黑洞
-	// 的 API server 会让租约操作永久挂起。负值被拒绝。
+	// RequestTimeout bounds each API interaction (Acquire, Renew, Release). It
+	// is also the ceiling Close waits for in-flight operations. Zero means
+	// defaultRequestTimeout; a caller context without a deadline is the normal
+	// case, so without this a black-holed API server would park the lease
+	// operations forever. Negative values are rejected.
+	// RequestTimeout 限制每次 API 交互（Acquire、Renew、Release）的时长，同时也是
+	// Close 等待在途操作的上限。零值表示 defaultRequestTimeout。调用方的 ctx 通常
+	// 没有 deadline，若没有这个限制，被黑洞的 API server 会让租约操作永久挂起。
+	// 负值被拒绝。
 	RequestTimeout time.Duration
 }
 
@@ -82,11 +84,25 @@ type LeaseAPI interface {
 var ErrInvalidObjectName = errors.New("k8slease: key must be a DNS-1123 subdomain")
 
 // ErrClosed means Close was called; the Locker accepts no new acquisitions.
+// An acquisition still in flight when Close begins also fails with it instead
+// of delivering a handle; if that attempt already wrote the Lease object, the
+// object stays until its term expires, like a handle dropped without Release.
 // Handles acquired before Close still use the API, but their Release only
 // empties the reservation table Close already cleared.
-// ErrClosed 表示 Close 已调用，Locker 不再接受新的获取。Close 之前取得的句柄
-// 仍可访问 API，但它们 Release 时清理的占用表已被 Close 清空。
+// ErrClosed 表示 Close 已调用，Locker 不再接受新的获取。Close 开始时仍在途的获取
+// 也以它失败，而不是交付句柄；若该次尝试已经写入 Lease 对象，对象会留到租期结束，
+// 与未 Release 就丢弃的句柄相同。Close 之前取得的句柄仍可访问 API，但它们 Release
+// 时清理的占用表已被 Close 清空。
 var ErrClosed = errors.New("k8slease: locker is closed")
+
+// ErrCloseTimeout means Close stopped waiting before every in-flight operation
+// finished. The Locker is still closed: late operations finish against the
+// API, an acquisition still in flight fails with ErrClosed, and a later Close
+// call waits again for whatever remains.
+// ErrCloseTimeout 表示 Close 在全部在途操作结束之前停止了等待。Locker 仍然已经关闭：
+// 迟到的操作继续访问 API，仍在途的获取以 ErrClosed 失败，之后再调用 Close 会继续等待
+// 剩余操作。
+var ErrCloseTimeout = errors.New("k8slease: close timed out waiting for in-flight operations")
 
 // dnsSubdomain is the name rule for Lease objects.
 // dnsSubdomain 是 Lease 对象的命名规则。
@@ -132,11 +148,14 @@ type Locker struct {
 	closed bool
 
 	// inflight counts API operations registered before Close began. Close waits
-	// on it so no API request from an operation that predates Close outlives it.
-	// Add shares mu with the closed check, so no operation can join Close's
-	// Wait; each operation pairs its Add with Done.
-	// inflight 记录 Close 开始前已登记的 API 操作数。Close 等待它，保证早于 Close
-	// 的操作发出的 API 请求不会活过 Close。Add 与 closed 检查共用 mu，因此没有
+	// on it, bounded by RequestTimeout, so an operation that predates Close is
+	// normally finished before Close returns; a timeout is reported as
+	// ErrCloseTimeout instead of pretending the drain completed. Add shares mu
+	// with the closed check, so no operation can join Close's Wait; each
+	// operation pairs its Add with Done.
+	// inflight 记录 Close 开始前已登记的 API 操作数。Close 等待它，上限是
+	// RequestTimeout，早于 Close 的操作因此通常在 Close 返回前结束；等待超时以
+	// ErrCloseTimeout 报告，而不是假装已经排空。Add 与 closed 检查共用 mu，因此没有
 	// 操作能在 Close 的 Wait 之后加入；每个操作的 Add 都与 Done 成对出现。
 	inflight sync.WaitGroup
 }
@@ -258,7 +277,29 @@ func (l *Locker) Acquire(ctx context.Context, key string, ttl time.Duration) (le
 		l.unreserve(key)
 		return nil, err
 	}
+	// Close may have begun while the API interaction was in flight. Its Wait
+	// covers this operation, but the handle must not be delivered: a shutdown
+	// that already saw Close return would otherwise still get a usable lease
+	// and start new work with it. The Lease object is left alone, exactly like
+	// a handle dropped without Release; Close never writes objects.
+	// Close 可能在这笔 API 交互在途时开始。Close 的等待覆盖本操作，但句柄不能交付：
+	// 否则已经看到 Close 返回的停机流程仍会拿到可用租约并据此开始新工作。Lease 对象
+	// 保持原样，与未 Release 就丢弃的句柄完全相同；Close 从不写对象。
+	if l.isClosed() {
+		l.unreserve(key)
+		return nil, fmt.Errorf("%w: acquisition of %q finished after Close", ErrClosed, key)
+	}
 	return held, nil
+}
+
+// isClosed reports whether Close has begun. Acquire's final check shares mu
+// with Close, so delivering a handle has a definite order relative to Close.
+// isClosed 报告 Close 是否已经开始。Acquire 的最终判定与 Close 共用 mu，交付句柄
+// 因此相对 Close 有明确的先后顺序。
+func (l *Locker) isClosed() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.closed
 }
 
 // reserve marks key as held by this process. It returns ErrHeld when the key is
@@ -316,15 +357,19 @@ func (l *Locker) endInflight(tracked bool) {
 }
 
 // Close clears the in-process reservations and rejects further acquisitions.
-// It waits for API operations already in flight to finish, up to RequestTimeout.
+// An acquisition still in flight when Close begins returns ErrClosed instead
+// of a handle. Close waits for API operations already in flight to finish, up
+// to RequestTimeout; when that wait runs out it returns ErrCloseTimeout, and
+// a later Close call waits again for whatever remains.
 //
 // It does not write the Lease objects: doing so would race with handles that
 // are still in use. A caller that wants to hand a lease back must Release its
 // handle before Close; a handle dropped without Release keeps its Lease until
 // the term expires, and Close only stops the stale reservation from blocking
 // this Locker forever.
-// Close 清空进程内占用并拒绝后续获取，并等待已经在途的 API 操作结束，
-// 最多等待 RequestTimeout。
+// Close 清空进程内占用并拒绝后续获取。Close 开始时仍在途的获取返回 ErrClosed，
+// 而不是交付句柄。Close 等待已经在途的 API 操作结束，最多等待 RequestTimeout；
+// 等待用尽时返回 ErrCloseTimeout，之后再调用 Close 会继续等待剩余操作。
 //
 // 它不写 Lease 对象：那样会与仍在使用的句柄竞争。想把租约交还的调用方必须在
 // Close 之前 Release 自己的句柄；被丢弃且未 Release 的句柄会让 Lease 一直存在到
@@ -349,9 +394,10 @@ func (l *Locker) Close() error {
 	defer timer.Stop()
 	select {
 	case <-done:
+		return nil
 	case <-timer.C:
+		return fmt.Errorf("%w after %s", ErrCloseTimeout, l.timeout)
 	}
-	return nil
 }
 
 // acquireReserved performs the API interaction for a key this process already

@@ -54,7 +54,8 @@ defer held.Release(ctx)
 ```
 
 **内置超时与 TTL 上限**：`Config.RequestTimeout` 限制每次 API 交互（`Acquire`、
-`Renew`、`Release`）的时长，零值取默认 10 秒，负值在构造时被拒绝。调用方的 `ctx`
+`Renew`、`Release`）的时长，也是 `Close` 等待在途操作的上限，零值取默认 10 秒，
+负值在构造时被拒绝。调用方的 `ctx`
 通常没有 deadline，没有这条预算时，被黑洞的 API server 会让租约操作永久挂起；
 `NewForConfig` 同时把它写进 `rest.Config.Timeout`（`rest.CopyConfig` 复制后再改，
 不改动调用方配置），形成传输层兜底，调用方显式设置的 `rest.Config.Timeout` 优先。
@@ -64,9 +65,11 @@ TTL 上限是 `LeaseDurationSeconds` 的 int32 范围（约 68 年）：更长�
 **Release 与 Close**：`Locker` 按 key 保留进程内占用（防止同一进程的两个 goroutine
 同时"恢复"同一租约），因此调用方必须 `Release` 自己取得的每个句柄；丢弃句柄会让该
 key 在本进程内一直返回 `ErrHeld`。`Locker.Close()` 清空占用表并拒绝后续 `Acquire`
-（返回 `k8slease.ErrClosed`）；Close 之前取得的句柄仍可 `Release`，用于给停机流程
-兜底。同一句柄上的 `Renew` 与 `Release` 由互斥锁串行化，并发续期不会因
-resourceVersion 冲突误报 `ErrLeaseLost`。
+（返回 `k8slease.ErrClosed`），Close 开始时仍在途的 `Acquire` 同样以 `ErrClosed`
+失败而不交付句柄。Close 最多等待 `RequestTimeout` 让在途 API 操作结束，等待用尽时
+返回 `k8slease.ErrCloseTimeout`（Locker 仍然已关闭，之后再调用 Close 可继续等待）；
+Close 之前取得的句柄仍可 `Release`，用于给停机流程兜底。同一句柄上的 `Renew` 与
+`Release` 由互斥锁串行化，并发续期不会因 resourceVersion 冲突误报 `ErrLeaseLost`。
 
 **只编译一个 API 组**：`NewForConfig` 用 `kubernetes/typed/coordination/v1` 的类型化
 客户端，而不是完整 `Clientset`，因此 `go.sum` 里不会出现所有内置 API 类型。

@@ -3,7 +3,9 @@ package k8slease_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -685,10 +687,13 @@ func TestCloseWaitsForInFlightRenew(t *testing.T) {
 	}
 }
 
-// TestCloseWaitIsBoundedByRequestTimeout pins the wait ceiling: a Close issued
-// while an operation ignores its own deadline still returns in bounded time.
-// TestCloseWaitIsBoundedByRequestTimeout 固定等待上限：在途操作无视自身 deadline
-// 时，Close 仍要在有界时间内返回。
+// TestCloseWaitIsBoundedByRequestTimeout pins the wait ceiling and its outcome:
+// a Close issued while an operation ignores its own deadline returns in bounded
+// time and reports ErrCloseTimeout instead of a silent success. A second Close
+// after the operation drains returns nil.
+// TestCloseWaitIsBoundedByRequestTimeout 固定等待上限及其结果：在途操作无视自身
+// deadline 时，Close 在有界时间内返回，并报告 ErrCloseTimeout 而不是静默成功。
+// 操作排空后再调用一次 Close 返回 nil。
 func TestCloseWaitIsBoundedByRequestTimeout(t *testing.T) {
 	api := newRenewGateAPI()
 	const budget = 40 * time.Millisecond
@@ -708,8 +713,8 @@ func TestCloseWaitIsBoundedByRequestTimeout(t *testing.T) {
 	<-api.entered
 
 	start := time.Now()
-	if err := l.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := l.Close(); !errors.Is(err, k8slease.ErrCloseTimeout) {
+		t.Fatalf("Close = %v, want ErrCloseTimeout", err)
 	}
 	elapsed := time.Since(start)
 	if elapsed < budget/2 {
@@ -722,6 +727,177 @@ func TestCloseWaitIsBoundedByRequestTimeout(t *testing.T) {
 	close(api.release)
 	if err := <-renewDone; err != nil {
 		t.Fatalf("Renew: %v", err)
+	}
+
+	// Once the operation has drained, a second Close reports success rather
+	// than repeating the first Close's timeout.
+	// 操作排空之后，第二次 Close 报告成功，而不是重复第一次的超时。
+	if err := l.Close(); err != nil {
+		t.Fatalf("second Close after drain: %v", err)
+	}
+}
+
+// TestCloseRejectsAcquireFinishingAfterClose pins P2-05: an Acquire that was
+// already in flight when Close began must fail with ErrClosed instead of
+// delivering a handle, even though the Kubernetes object was acquired. The
+// object is intentionally left to expire, like a handle dropped without
+// Release; the control case (a handle acquired before Close) is covered by
+// TestCloseFreesReservationsAndRejectsAcquire.
+// TestCloseRejectsAcquireFinishingAfterClose 固定 P2-05：Close 开始时已在途的
+// Acquire 必须以 ErrClosed 失败，而不是交付句柄，即使 Kubernetes 对象已经取得。
+// 该对象刻意留到自然过期，等同未 Release 就丢弃的句柄；对照行（Close 之前取得的
+// 句柄）由 TestCloseFreesReservationsAndRejectsAcquire 覆盖。
+func TestCloseRejectsAcquireFinishingAfterClose(t *testing.T) {
+	api := newRenewGateAPI()
+	const budget = 40 * time.Millisecond
+	l, err := k8slease.New(api, k8slease.Config{Namespace: "default", Identity: "pod-a", RequestTimeout: budget})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	api.blocked.Store(true)
+	api.ignoreCtx.Store(true)
+	type result struct {
+		held lease.Lease
+		err  error
+	}
+	acquired := make(chan result, 1)
+	go func() {
+		held, err := l.Acquire(context.Background(), "settle-reconcile", ttl)
+		acquired <- result{held: held, err: err}
+	}()
+	<-api.entered
+
+	if err := l.Close(); !errors.Is(err, k8slease.ErrCloseTimeout) {
+		t.Fatalf("Close = %v, want ErrCloseTimeout while the Acquire is parked", err)
+	}
+	select {
+	case r := <-acquired:
+		t.Fatalf("Acquire returned before the API was released: %+v", r)
+	default:
+	}
+
+	close(api.release)
+	r := <-acquired
+	if !errors.Is(r.err, k8slease.ErrClosed) {
+		t.Fatalf("Acquire = %v, want ErrClosed", r.err)
+	}
+	if r.held != nil {
+		t.Fatalf("Acquire delivered %v after Close", r.held)
+	}
+	if got := api.holder("settle-reconcile"); got != "pod-a" {
+		t.Fatalf("holder = %q, want the object left behind for pod-a until expiry", got)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close after the refused acquisition drained: %v", err)
+	}
+}
+
+// TestLifecycleOperationsRunConcurrently puts Close, Acquire, Renew and Release
+// on one Locker at the same time. The test does not prescribe the
+// interleaving; it requires every outcome to stay inside the documented set
+// while -race checks the locking discipline itself.
+// TestLifecycleOperationsRunConcurrently 让 Close、Acquire、Renew 与 Release 同时
+// 操作一个 Locker。测试不规定交错顺序，只要求所有结果落在文档允许的集合内，并由
+// -race 检查锁纪律本身。
+func TestLifecycleOperationsRunConcurrently(t *testing.T) {
+	const workers = 6
+	api := newFakeAPI()
+	l, err := k8slease.New(api, k8slease.Config{
+		Namespace:      "default",
+		Identity:       "pod-a",
+		RequestTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	keys := make([]string, workers)
+	handles := make([]lease.Lease, workers)
+	for i := range keys {
+		keys[i] = "race-" + strconv.Itoa(i)
+		held, err := l.Acquire(context.Background(), keys[i], ttl)
+		if err != nil {
+			t.Fatalf("pre-acquire %s: %v", keys[i], err)
+		}
+		handles[i] = held
+	}
+
+	start := make(chan struct{})
+	renewing := make(chan struct{}, workers)
+	errs := make(chan error, workers*3+1)
+	report := func(err error) { errs <- err }
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(3)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			renewing <- struct{}{}
+			for j := 0; j < 50; j++ {
+				// A lost lease is expected once the matching Release below wins
+				// the race; anything else is a real failure.
+				// 与会 Release 竞争后丢失租约是预期的，其他错误才算失败。
+				if err := handles[i].Renew(context.Background()); err != nil && !errors.Is(err, lease.ErrLeaseLost) {
+					report(fmt.Errorf("renew %s: %w", keys[i], err))
+					return
+				}
+				runtime.Gosched()
+			}
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			late := "late-" + strconv.Itoa(i)
+			held, err := l.Acquire(context.Background(), late, ttl)
+			switch {
+			case err == nil:
+				if held == nil {
+					report(fmt.Errorf("late acquire %s returned no handle and no error", late))
+					return
+				}
+				if err := held.Release(context.Background()); err != nil {
+					report(fmt.Errorf("late release %s: %w", late, err))
+				}
+			case errors.Is(err, k8slease.ErrClosed):
+				// The normal outcome once Close won the race.
+				// Close 赢得竞争后的正常结果。
+			default:
+				report(fmt.Errorf("late acquire %s: %w", late, err))
+			}
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			runtime.Gosched()
+			if err := handles[i].Release(context.Background()); err != nil {
+				report(fmt.Errorf("release %s: %w", keys[i], err))
+			}
+		}(i)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		// Wait until every renewer has entered its loop, so Close really does
+		// overlap Renew instead of possibly running first in isolation.
+		// 等所有续期方进入循环，确保 Close 与 Renew 真正重叠，而不是可能先单独跑完。
+		for i := 0; i < workers; i++ {
+			<-renewing
+		}
+		runtime.Gosched()
+		if err := l.Close(); err != nil {
+			report(fmt.Errorf("close: %w", err))
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }
 

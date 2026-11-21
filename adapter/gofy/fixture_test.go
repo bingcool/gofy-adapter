@@ -141,6 +141,67 @@ func TestBindAllRejectsMissingDependencies(t *testing.T) {
 	}
 }
 
+// typedNilPointerImpl and typedNilValueImpl exist only to show that both
+// receiver forms survive reflection on a nil pointer: the method set is there,
+// so nothing below the typed-nil check notices the value is unusable.
+// typedNilPointerImpl 与 typedNilValueImpl 只用于证明两种接收者形态都能在 nil 指针上
+// 通过反射：方法集还在，typed-nil 检查之下的所有校验都发现不了这个值不可用。
+type typedNilPointerImpl struct{ name string }
+
+func (impl *typedNilPointerImpl) GetItem(_ context.Context, req *testcontract.ItemRequest) (*testcontract.ItemResponse, error) {
+	return &testcontract.ItemResponse{Item: &testcontract.ItemDTO{ID: req.ID, Name: impl.name}}, nil
+}
+
+type typedNilValueImpl struct{}
+
+func (typedNilValueImpl) GetItem(_ context.Context, req *testcontract.ItemRequest) (*testcontract.ItemResponse, error) {
+	return &testcontract.ItemResponse{Item: &testcontract.ItemDTO{ID: req.ID}}, nil
+}
+
+// TestBindAllRejectsTypedNilImplementation pins P2-04: a nil *T stored in the
+// any is not a nil any, so the old check let it through and every signature
+// check passed; the first request then panicked on the nil receiver. Both
+// receiver forms must fail at assembly time with no route registered.
+// TestBindAllRejectsTypedNilImplementation 固定 P2-04：装在 any 里的 nil *T 不是 nil
+// any，旧检查会放行，所有签名检查也都通过；第一个请求随即 panic 在 nil 接收者上。两种
+// 接收者形态都必须在装配期失败，且不留任何已注册路由。
+func TestBindAllRejectsTypedNilImplementation(t *testing.T) {
+	cases := []struct {
+		name string
+		impl any
+	}{
+		{"pointer receiver", (*typedNilPointerImpl)(nil)},
+		{"value receiver", (*typedNilValueImpl)(nil)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, r := newFixtureRouter()
+			err := gofyadapter.BindAll(r, []endpoint.Descriptor{testcontract.GetItem}, tc.impl, gofyadapter.BindOptions{})
+			if err == nil || !strings.Contains(err.Error(), "typed nil") {
+				t.Fatalf("BindAll error = %v, want typed nil", err)
+			}
+			if registered := engine.Routes(); len(registered) != 0 {
+				t.Fatalf("failed BindAll left %d route(s) registered: %v", len(registered), registered)
+			}
+		})
+	}
+}
+
+// TestBindAllAcceptsPointerImplementation is the control row of the matrix: a
+// non-nil pointer must still bind and actually serve a request.
+// TestBindAllAcceptsPointerImplementation 是矩阵里的对照行：非 nil 指针必须照常绑定
+// 并真正响应请求。
+func TestBindAllAcceptsPointerImplementation(t *testing.T) {
+	engine, r := newFixtureRouter()
+	if err := gofyadapter.BindAll(r, []endpoint.Descriptor{testcontract.GetItem}, &fixtureImpl{}, gofyadapter.BindOptions{}); err != nil {
+		t.Fatalf("BindAll: %v", err)
+	}
+	rec := serve(engine, http.MethodGet, "/api/test/items/7")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestRateLimitHookReceivesRouterResponder pins F6's adapter half: the hook is
 // handed the Router's responder, so the limiter it builds rejects with the same
 // envelope as the handlers instead of a library default.

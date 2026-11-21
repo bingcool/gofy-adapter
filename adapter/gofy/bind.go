@@ -162,10 +162,27 @@ type pendingBinding struct {
 // route instead of stopping at the first one.
 // Registration is deferred until the whole set passes validation, so a failed
 // bind never leaves a partially registered router.
+//
+// Duplicate detection runs on the Gin form of the path — bindPath, then ginPath,
+// with wildcard names ignored — because Gin panics on a second wildcard name at
+// the same position or on a path that is already registered. Comparing raw
+// contract paths missed both, and the panic happened after earlier routes had
+// already been registered.
+//
+// An impl that holds a typed nil — a nil *OrderService stored in the any — is
+// rejected here too: it carries the method set, so every check below would pass
+// and the first request would panic on the nil receiver.
 // BindAll 校验路由集合并把每个描述符绑定到 impl。
 // 签名与元数据问题会聚合返回：错误里列出所有失败的路由，而不是遇到第一个
 // 就退出。
 // 只有整组路由全部通过校验后才注册，因此绑定失败不会留下只注册了一半的 Router。
+//
+// 重复检测基于路径的 Gin 形态——先 bindPath，再 ginPath，并忽略通配段名字——因为 Gin
+// 会在同位置出现第二个通配名或路径已注册时 panic。只比较原始契约路径两种情况都会漏掉，
+// 而 panic 发生时前面的路由已经注册。
+//
+// 装着 typed nil 的 impl——即 any 里的 nil *OrderService——同样在这里被拒：它带着完整的
+// 方法集，下面所有校验都会通过，而第一个请求会在 nil 接收者上 panic。
 func BindAll(
 	r *support.Router,
 	routes []endpoint.Descriptor,
@@ -185,8 +202,11 @@ func BindAll(
 	var pending []pendingBinding
 
 	seenOp := make(map[string]bool, len(routes))
-	seenRoute := make(map[string]bool, len(routes))
+	seenRoute := make(map[string]string, len(routes))
 	value := reflect.ValueOf(impl)
+	if isNilImplementation(value) {
+		return fmt.Errorf("gofyadapter: implementation is a typed nil %s", value.Type())
+	}
 	responder := r.Responder()
 
 	for _, desc := range routes {
@@ -213,11 +233,14 @@ func BindAll(
 		} else if err := requireURIFields(desc.RequestType(), placeholders); err != nil {
 			add("%s: %v", name, err)
 		}
-		key := spec.Method + " " + spec.Path
-		if seenRoute[key] {
-			add("%s: duplicate route %s", name, key)
+		bindingPath := ginPath(bindPath(r, spec.Path))
+		key := canonicalGinRoute(spec.Method, bindingPath)
+		if owner, exists := seenRoute[key]; exists {
+			add("%s: duplicate route %s %s conflicts with %s (gin path %s)",
+				name, spec.Method, spec.Path, owner, bindingPath)
+		} else {
+			seenRoute[key] = name
 		}
-		seenRoute[key] = true
 
 		if spec.NoContent && spec.ResponseKind != endpoint.KindJSON {
 			add("%s: NoContent and ResponseKind are mutually exclusive", name)
@@ -252,7 +275,7 @@ func BindAll(
 		}
 		pending = append(pending, pendingBinding{
 			method:  spec.Method,
-			path:    ginPath(bindPath(r, spec.Path)),
+			path:    bindingPath,
 			handler: dynamicHandler(r, responder, method, desc, spec),
 			mw:      mw,
 		})
@@ -536,4 +559,40 @@ func ginPath(path string) string {
 		rest = rest[start+end+1:]
 	}
 	return out.String()
+}
+
+// canonicalGinRoute identifies a route the way Gin's tree does: the method plus
+// the path with wildcard names removed. Gin keeps one wildcard per position and
+// panics when a second name arrives, so /users/{id} and /users/{name} are the
+// same route to it even though the contract paths differ; an exact path
+// collision shares the key with the names still in place. The value is only
+// compared, never registered.
+// canonicalGinRoute 按 Gin 路由树的视角标识一条路由：方法 + 去掉通配段名字的路径。
+// Gin 在每个位置只保留一个通配节点，出现第二个名字就 panic，因此 /users/{id} 与
+// /users/{name} 对它是同一条路由，尽管契约路径不同；完全相同的路径也落在同一个 key 上。
+// 该值只用于比较，不参与注册。
+func canonicalGinRoute(method, path string) string {
+	segments := strings.Split(path, "/")
+	for i, segment := range segments {
+		if segment != "" && (segment[0] == ':' || segment[0] == '*') {
+			segments[i] = segment[:1]
+		}
+	}
+	return method + " " + strings.Join(segments, "/")
+}
+
+// isNilImplementation reports whether impl holds a typed nil: the interface is
+// not nil, but the value behind it is. Every case shares the failure mode — the
+// method set is present, so reflection finds and validates the method, and the
+// nil only surfaces when a request calls it.
+// isNilImplementation 报告 impl 是否装着 typed nil：接口本身非 nil，背后的值却是 nil。
+// 各类形态的失败方式相同——方法集还在，反射能取到并校验方法，nil 要等到请求调用时
+// 才暴露。
+func isNilImplementation(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Ptr, reflect.Slice, reflect.UnsafePointer:
+		return v.IsNil()
+	}
+	return false
 }

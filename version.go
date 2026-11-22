@@ -15,4 +15,4 @@ package adapter
 // for the module; change it together with the release notes, not on its own.
 // Version 是 gofy-adapter 模块版本，也是本模块的唯一来源；改它要连发布说明一起改，
 // 不要单独改动。
-const Version = "1.0.0"
+const Version = "0.8.0"

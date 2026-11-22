@@ -3,8 +3,8 @@ module github.com/bingcool/gofy-adapter
 go 1.26.0
 
 require (
-	github.com/bingcool/gofy v0.0.0
-	github.com/bingcool/gofy-interface-api v0.0.0
+	github.com/bingcool/gofy v0.8.0
+	github.com/bingcool/gofy-interface-api v0.8.0
 	github.com/gin-gonic/gin v1.12.0
 )
 
@@ -87,9 +87,4 @@ require (
 	k8s.io/api v0.34.1
 	k8s.io/apimachinery v0.34.1
 	k8s.io/client-go v0.34.1
-)
-
-replace (
-	github.com/bingcool/gofy => ../gofy
-	github.com/bingcool/gofy-interface-api => ../gofy-interface-api
 )

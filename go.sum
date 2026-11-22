@@ -2,6 +2,10 @@ github.com/andybalholm/brotli v1.0.5 h1:8uQZIdzKmjc/iuPu7O2ioW48L81FgatrcpfFmiq/
 github.com/andybalholm/brotli v1.0.5/go.mod h1:fO7iG3H7G2nSZ7m0zPUDn85XEX2GTukHGRSepvi9Eig=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
+github.com/bingcool/gofy v0.8.0 h1:9h09qQSOmPn1QelNqyq0mMHwxLOLm63r/PSAVRKycVs=
+github.com/bingcool/gofy v0.8.0/go.mod h1:PGsty3Bs6uMRboxXoc7P0CAJtYefDIG91RkcrYmULFw=
+github.com/bingcool/gofy-interface-api v0.8.0 h1:CKwT+5vtQMhy02PXZQ1GhNr0Hd5cPpWIaiYOe/bUPhE=
+github.com/bingcool/gofy-interface-api v0.8.0/go.mod h1:rZkOhOmkx9gIMcgXmy1/JCYAwmqTr3Eou0JqOMaCKcs=
 github.com/bool64/dev v0.2.45 h1:3nLKhAS/6Oklk3Mt2lHYSN/Cb4tdAD77KLwzeP+6eYE=
 github.com/bool64/dev v0.2.45/go.mod h1:iJbh1y/HkunEPhgebWRNcs8wfGq7sjvJ6W5iabL8ACg=
 github.com/bytedance/gopkg v0.1.4 h1:oZnQwnX82KAIWb7033bEwtxvTqXcYMxDBaQxo5JJHWM=

@@ -88,3 +88,8 @@ require (
 	k8s.io/apimachinery v0.34.1
 	k8s.io/client-go v0.34.1
 )
+
+replace (
+	github.com/bingcool/gofy => ../gofy
+	github.com/bingcool/gofy-interface-api => ../gofy-interface-api
+)

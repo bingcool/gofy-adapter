@@ -475,29 +475,56 @@ func checkSignature(method reflect.Value, reqType, resType reflect.Type, noConte
 	return nil
 }
 
+// pathPlaceholders returns the {name} segments of a contract path. Each
+// placeholder must fill a whole segment, because Gin turns it into a wildcard
+// that runs to the next '/': "/x/{id}.json" is registered as ":id.json", so the
+// parameter arrives as "id.json" and the uri-tagged field never matches.
+//
+// Gin's own ":name" and "*name" syntax is rejected too. A contract path is
+// framework-agnostic — the generated client and docgen treat those characters
+// as literals — and a ":name" segment would skip the placeholder checks
+// entirely while Gin still treated it as a wildcard.
+// pathPlaceholders 返回契约路径里的 {name} 段。每个占位符必须占满一整段，因为 Gin 会把它
+// 渲染成延伸到下一个 '/' 的通配段："/x/{id}.json" 注册成 ":id.json"，参数名因此变成
+// "id.json"，uri 标签永远匹配不上。
+//
+// Gin 自己的 ":name" 与 "*name" 语法同样被拒。契约路径与框架无关——生成的客户端和 docgen
+// 把这两个字符当字面量——而 ":name" 段会完全跳过占位符校验，Gin 却仍按通配处理。
 func pathPlaceholders(path string) ([]string, error) {
 	var out []string
 	seen := make(map[string]bool)
-	rest := path
-	for {
-		start := strings.IndexByte(rest, '{')
-		if start < 0 {
-			break
+	for _, segment := range strings.Split(path, "/") {
+		if i := strings.IndexAny(segment, ":*"); i >= 0 {
+			name := segment[i+1:]
+			if name == "" {
+				name = "name"
+			}
+			return nil, fmt.Errorf("segment %q uses Gin wildcard syntax; write {%s} instead", segment, name)
 		}
-		end := strings.IndexByte(rest[start:], '}')
-		if end < 0 {
+		open := strings.IndexByte(segment, '{')
+		closed := strings.IndexByte(segment, '}')
+		switch {
+		case open < 0 && closed < 0:
+			continue
+		case open < 0:
+			return nil, fmt.Errorf("stray '}' in segment %q", segment)
+		case closed < 0:
 			return nil, fmt.Errorf("unclosed placeholder in %q", path)
+		case open != 0 || closed != len(segment)-1:
+			return nil, fmt.Errorf("placeholder in segment %q must fill the whole segment", segment)
 		}
-		name := rest[start+1 : start+end]
+		name := segment[1 : len(segment)-1]
 		if name == "" {
 			return nil, fmt.Errorf("empty placeholder in %q", path)
+		}
+		if strings.ContainsAny(name, "{}:* \t") {
+			return nil, fmt.Errorf("invalid placeholder name %q", name)
 		}
 		if seen[name] {
 			return nil, fmt.Errorf("duplicate placeholder %q", name)
 		}
 		seen[name] = true
 		out = append(out, name)
-		rest = rest[start+end+1:]
 	}
 	return out, nil
 }

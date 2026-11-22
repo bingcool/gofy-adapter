@@ -158,6 +158,15 @@ type Locker struct {
 	// ErrCloseTimeout 报告，而不是假装已经排空。Add 与 closed 检查共用 mu，因此没有
 	// 操作能在 Close 的 Wait 之后加入；每个操作的 Add 都与 Done 成对出现。
 	inflight sync.WaitGroup
+
+	// drainOnce guards drained. Close can time out and be called again, and
+	// every call must observe the same waiter: a fresh goroutine per call would
+	// leave one blocked on inflight.Wait for each call that outlives the
+	// operation it waited for.
+	// drainOnce 保护 drained。Close 可能超时后被再次调用，每次调用都必须看到同一个等待者：
+	// 每次新建 goroutine 会让每个活得比被等操作更久的调用留下一个阻塞在 inflight.Wait 上。
+	drainOnce sync.Once
+	drained   chan struct{}
 }
 
 // NewForConfig builds a locker from a rest config, using the typed coordination
@@ -385,19 +394,30 @@ func (l *Locker) Close() error {
 	// issued from inside an in-flight operation cannot hang on itself.
 	// 等待时不能持有 mu：在途的 Renew / Release 可能还需要它清理占用。超时给等待
 	// 设上限，从在途操作内部调用 Close 时不会把自己永久等死。
-	done := make(chan struct{})
-	go func() {
-		l.inflight.Wait()
-		close(done)
-	}()
 	timer := time.NewTimer(l.timeout)
 	defer timer.Stop()
 	select {
-	case <-done:
+	case <-l.closeWaiter():
 		return nil
 	case <-timer.C:
 		return fmt.Errorf("%w after %s", ErrCloseTimeout, l.timeout)
 	}
+}
+
+// closeWaiter returns the channel closed when the in-flight set drains. The
+// waiter goroutine and its channel are created once and shared by every Close
+// call, including the ones that follow a timeout.
+// closeWaiter 返回在途集合排空时关闭的 channel。等待 goroutine 与其 channel 只创建一次，
+// 由所有 Close 调用共享，包括超时之后的那些调用。
+func (l *Locker) closeWaiter() <-chan struct{} {
+	l.drainOnce.Do(func() {
+		l.drained = make(chan struct{})
+		go func() {
+			l.inflight.Wait()
+			close(l.drained)
+		}()
+	})
+	return l.drained
 }
 
 // acquireReserved performs the API interaction for a key this process already

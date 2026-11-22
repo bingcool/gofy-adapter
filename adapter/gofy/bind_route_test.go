@@ -136,3 +136,98 @@ func TestBindAllRejectsGroupTrimmedCollision(t *testing.T) {
 		t.Fatalf("failed BindAll left %d route(s) registered: %v", len(registered), registered)
 	}
 }
+
+// routePairRequest carries two placeholders, for the case where a contract path
+// tries to put both in one segment.
+// routePairRequest 带两个占位符，用于契约路径把两者塞进同一段的情形。
+type routePairRequest struct {
+	A string `uri:"a"`
+	B string `uri:"b"`
+}
+
+type placeholderImpl struct{}
+
+func (placeholderImpl) GetPair(_ context.Context, _ *routePairRequest) (*testcontract.ItemResponse, error) {
+	return &testcontract.ItemResponse{}, nil
+}
+
+func (placeholderImpl) GetByID(_ context.Context, _ *testcontract.ItemRequest) (*testcontract.ItemResponse, error) {
+	return &testcontract.ItemResponse{}, nil
+}
+
+// TestBindAllRejectsPlaceholderSharingSegment pins the shape Gin panics on:
+// "/x/{a}-{b}" becomes "/x/:a-:b", and Gin allows one wildcard per segment. The
+// panic would fire during registration, after validation said the set was fine
+// and after earlier routes had gone live.
+// TestBindAllRejectsPlaceholderSharingSegment 固定 Gin 会 panic 的形态："/x/{a}-{b}"
+// 变成 "/x/:a-:b"，而 Gin 每段只允许一个通配符。panic 会发生在注册阶段——校验刚说完
+// 没问题、前面的路由也已经上线之后。
+func TestBindAllRejectsPlaceholderSharingSegment(t *testing.T) {
+	engine, r := newFixtureRouter()
+	desc := conflictRoute[routePairRequest, testcontract.ItemResponse](
+		"GetPair", http.MethodGet, "/api/test/x/{a}-{b}")
+	err := gofyadapter.BindAll(r, []endpoint.Descriptor{desc}, placeholderImpl{}, gofyadapter.BindOptions{})
+	if err == nil || !strings.Contains(err.Error(), "whole segment") {
+		t.Fatalf("BindAll error = %v, want whole-segment rejection", err)
+	}
+	if registered := engine.Routes(); len(registered) != 0 {
+		t.Fatalf("rejected route was registered anyway: %v", registered)
+	}
+}
+
+// TestBindAllRejectsPlaceholderWithSuffix covers the silent variant: Gin reads
+// "/x/{id}.json" as a wildcard named "id.json", so the ui-tagged field "id"
+// would stay empty and the handler would receive a zero value with no error.
+// TestBindAllRejectsPlaceholderWithSuffix 覆盖静默的那一类：Gin 把 "/x/{id}.json"
+// 读成名为 "id.json" 的通配段，uri:"id" 的字段因此一直为空，handler 拿到零值且没有报错。
+func TestBindAllRejectsPlaceholderWithSuffix(t *testing.T) {
+	engine, r := newFixtureRouter()
+	desc := conflictRoute[testcontract.ItemRequest, testcontract.ItemResponse](
+		"GetByID", http.MethodGet, "/api/test/x/{id}.json")
+	err := gofyadapter.BindAll(r, []endpoint.Descriptor{desc}, placeholderImpl{}, gofyadapter.BindOptions{})
+	if err == nil || !strings.Contains(err.Error(), "whole segment") {
+		t.Fatalf("BindAll error = %v, want whole-segment rejection", err)
+	}
+	if registered := engine.Routes(); len(registered) != 0 {
+		t.Fatalf("rejected route was registered anyway: %v", registered)
+	}
+}
+
+// TestBindAllRejectsGinWildcardSyntax: ":id" and "*rest" are Gin syntax, not
+// contract syntax. They skip pathPlaceholders entirely, so the uri-tag check
+// never runs, while Gin still binds them as wildcards — a contract that the
+// generated client cannot reproduce.
+// TestBindAllRejectsGinWildcardSyntax：":id" 与 "*rest" 是 Gin 语法而非契约语法。它们
+// 完全跳过 pathPlaceholders，uri 标签校验因此不执行，Gin 却仍按通配段绑定——生成的客户端
+// 复现不了这样一条契约。
+func TestBindAllRejectsGinWildcardSyntax(t *testing.T) {
+	for _, path := range []string{"/api/test/x/:id", "/api/test/x/*rest"} {
+		t.Run(path, func(t *testing.T) {
+			engine, r := newFixtureRouter()
+			desc := conflictRoute[testcontract.ItemRequest, testcontract.ItemResponse](
+				"GetByID", http.MethodGet, path)
+			err := gofyadapter.BindAll(r, []endpoint.Descriptor{desc}, placeholderImpl{}, gofyadapter.BindOptions{})
+			if err == nil || !strings.Contains(err.Error(), "Gin wildcard syntax") {
+				t.Fatalf("BindAll error = %v, want Gin-syntax rejection", err)
+			}
+			if registered := engine.Routes(); len(registered) != 0 {
+				t.Fatalf("rejected route was registered anyway: %v", registered)
+			}
+		})
+	}
+}
+
+// TestBindAllAcceptsWholeSegmentPlaceholder keeps the new rules from
+// over-rejecting the normal shape.
+// TestBindAllAcceptsWholeSegmentPlaceholder 确保新规则不会误伤正常形态。
+func TestBindAllAcceptsWholeSegmentPlaceholder(t *testing.T) {
+	engine, r := newFixtureRouter()
+	desc := conflictRoute[testcontract.ItemRequest, testcontract.ItemResponse](
+		"GetByID", http.MethodGet, "/api/test/x/{id}")
+	if err := gofyadapter.BindAll(r, []endpoint.Descriptor{desc}, placeholderImpl{}, gofyadapter.BindOptions{}); err != nil {
+		t.Fatalf("BindAll: %v", err)
+	}
+	if registered := engine.Routes(); len(registered) != 1 {
+		t.Fatalf("registered %d routes, want 1: %v", len(registered), registered)
+	}
+}
